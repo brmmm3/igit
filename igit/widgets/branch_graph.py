@@ -302,6 +302,9 @@ class BranchGraphPanel(QWidget):
         # Get commits
         branch = '' if self._branch_combo.currentIndex() == 0 else self._branch_combo.currentText()
         self._commits = self._git.get_commit_graph(branch=branch, max_count=200)
+        # Aggregate change totals for all commits in one call (avoids a git
+        # process per commit, which made opening the repo very slow).
+        self._commit_totals = self._git.get_commit_totals_bulk(max_count=200, branch=branch)
 
         self._graph_widget.set_commits(self._commits)
 
@@ -345,14 +348,14 @@ class BranchGraphPanel(QWidget):
             else:
                 item.setText(4, '')
 
-            # Column 5: Change statistics (+added/-removed)
-            stats = self._git.get_commit_stats(commit['full_sha'])
-            added = stats.get('total_added', 0)
-            removed = stats.get('total_removed', 0)
+            # Column 5: Change statistics (+added/-removed) from bulk totals
+            stats = self._commit_totals.get(commit['sha'], {})
+            added = stats.get('added', 0)
+            removed = stats.get('removed', 0)
+            files = stats.get('files', 0)
             item.setText(5, f"+{added}/-{removed}")
-            item.setToolTip(5, f"{stats.get('total_files', 0)} file(s) changed, "
-                               f"+{added} added, -{removed} removed, "
-                               f"{self._format_bytes(stats.get('total_bytes', 0))}")
+            item.setToolTip(5, f"{files} file(s) changed, "
+                               f"+{added} added, -{removed} removed")
             if added or removed:
                 item.setForeground(5, QBrush(QColor('#1a7f37') if added >= removed else QColor('#cf222e')))
 

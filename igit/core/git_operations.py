@@ -423,6 +423,51 @@ class GitOperations:
         base = self._commit_base(oldest_sha)
         return self._diff_stats(base, newest_sha)
 
+    def get_commit_totals_bulk(self, max_count: int = 200,
+                               branch: str = '') -> Dict[str, Dict[str, Any]]:
+        """Get aggregate change totals for many commits in a single git call.
+
+        Returns a dict mapping short-sha -> {added, removed, files}.
+        Used to populate the graph's changes column without spawning a git
+        process per commit.
+        """
+        totals: Dict[str, Dict[str, Any]] = {}
+        try:
+            # NUL-prefix the hash so commit headers are unambiguously detected
+            args = ['--numstat', '--format=%x00%h', f'-{max_count}']
+            if branch:
+                args.append(branch)
+            else:
+                args.append('--all')
+            out = self.repo.git.log(*args)
+
+            current_sha = ''
+            for line in out.splitlines():
+                if not line:
+                    continue
+                if line.startswith('\x00'):
+                    # Commit header line (NUL-prefixed short sha)
+                    current_sha = line[1:].strip()
+                    if current_sha not in totals:
+                        totals[current_sha] = {'added': 0, 'removed': 0, 'files': 0}
+                    continue
+                parts = line.split('\t')
+                if len(parts) < 3 or not current_sha:
+                    continue
+                added_s, removed_s = parts[0], parts[1]
+                if added_s == '-' or removed_s == '-':
+                    added = removed = 0
+                else:
+                    added = int(added_s)
+                    removed = int(removed_s)
+                entry = totals[current_sha]
+                entry['added'] += added
+                entry['removed'] += removed
+                entry['files'] += 1
+        except GitCommandError:
+            pass
+        return totals
+
     def _diff_stats(self, base: str, target: str) -> Dict[str, Any]:
         """Compute per-file and total change statistics between two refs."""
         result: Dict[str, Any] = {
