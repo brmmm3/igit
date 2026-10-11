@@ -1,37 +1,66 @@
-"""Commit history graph with branch visualization."""
+"""Commit history graph with colored branch visualization."""
 
 from typing import List, Dict, Any, Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QPushButton, QLabel, QHeaderView, QAbstractItemView, QMenu,
-    QComboBox, QLineEdit
+    QComboBox, QLineEdit, QStyleFactory
 )
 from PySide6.QtCore import Qt, Signal, Slot, QSize, QMimeData
 from PySide6.QtGui import (
-    QColor, QBrush, QFont, QPainter, QPen, QIcon, QAction, QDrag
+    QColor, QBrush, QFont, QPainter, QPen, QIcon, QAction, QDrag,
+    QPixmap, QFontMetrics
 )
 
 from ..core.git_operations import GitOperations, CommitInfo
 
 
-class CommitGraphWidget(QWidget):
-    """Custom widget that draws the commit graph with branch lines."""
+# ── Color palette for branch lanes ─────────────────────────────
+BRANCH_COLORS = [
+    QColor('#0969da'),  # blue
+    QColor('#1a7f37'),  # green
+    QColor('#9a6700'),  # yellow
+    QColor('#8250df'),  # purple
+    QColor('#cf222e'),  # red
+    QColor('#0550ae'),  # dark blue
+    QColor('#116329'),  # dark green
+    QColor('#953800'),  # orange
+    QColor('#622cbc'),  # dark purple
+    QColor('#a40e26'),  # dark red
+    QColor('#008080'),  # teal
+    QColor('#6e7681'),  # gray
+]
 
-    NODE_RADIUS = 5
-    LANE_WIDTH = 20
+# Lighter versions for backgrounds
+BRANCH_BG_COLORS = [
+    QColor('#ddf4ff'),  # blue bg
+    QColor('#dafbe1'),  # green bg
+    QColor('#fff8c5'),  # yellow bg
+    QColor('#fbefff'),  # purple bg
+    QColor('#ffebe9'),  # red bg
+    QColor('#ddf4ff'),  # dark blue bg
+    QColor('#dafbe1'),  # dark green bg
+    QColor('#fff1e5'),  # orange bg
+    QColor('#fbefff'),  # dark purple bg
+    QColor('#ffebe9'),  # dark red bg
+    QColor('#e6f8f8'),  # teal bg
+    QColor('#f0f6fc'),  # gray bg
+]
+
+
+class CommitGraphWidget(QWidget):
+    """Custom widget that draws the commit graph with colored branch lines."""
+
+    NODE_RADIUS = 6
+    LANE_WIDTH = 22
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._commits: List[Dict[str, Any]] = []
         self._lanes: Dict[str, int] = {}  # sha -> lane index
-        self._colors = [
-            QColor('#0969da'), QColor('#1a7f37'), QColor('#9a6700'),
-            QColor('#8250df'), QColor('#cf222e'), QColor('#0550ae'),
-            QColor('#116329'), QColor('#953800'), QColor('#622cbc'),
-            QColor('#a40e26'),
-        ]
+        self._lane_colors: Dict[int, QColor] = {}  # lane -> color
         self.setMinimumWidth(60)
-        self.setMaximumWidth(120)
+        self.setMaximumWidth(140)
 
     def set_commits(self, commits: List[Dict[str, Any]]):
         """Set the commits and compute lane assignments."""
@@ -40,9 +69,11 @@ class CommitGraphWidget(QWidget):
         self.update()
 
     def _compute_lanes(self):
-        """Assign each commit to a lane for graph drawing."""
+        """Assign each commit to a lane and pick colors."""
         self._lanes = {}
+        self._lane_colors = {}
         active_lanes: Dict[int, str] = {}  # lane -> sha still active
+        next_color = 0
 
         for i, commit in enumerate(self._commits):
             sha = commit['sha']
@@ -64,13 +95,14 @@ class CommitGraphWidget(QWidget):
                 while lane in used:
                     lane += 1
                 self._lanes[sha] = lane
+                self._lane_colors[lane] = BRANCH_COLORS[next_color % len(BRANCH_COLORS)]
+                next_color += 1
                 active_lanes[lane] = sha
 
             # Clean up lanes for merged commits
             for parent in parents:
                 for lane, active_sha in list(active_lanes.items()):
                     if active_sha == parent:
-                        # Check if any later commit has this parent
                         still_needed = any(
                             parent in c['parents']
                             for c in self._commits[i + 1:]
@@ -102,27 +134,31 @@ class CommitGraphWidget(QWidget):
                     parent_y = self._find_parent_y(parent)
                     if parent_y > y:
                         px = padding + parent_lane * self.LANE_WIDTH + self.LANE_WIDTH // 2
-                        color = self._colors[(lane + parent_lane) % len(self._colors)]
+                        color = self._lane_colors.get(lane, BRANCH_COLORS[0])
 
-                        pen = QPen(color, 2)
+                        pen = QPen(color, 2.5)
                         painter.setPen(pen)
 
-                        # Draw bezier curve
+                        # Draw connecting lines
                         mid_y = (y + parent_y) // 2
-                        path = painter.pen()
                         painter.drawLine(x, y, x, mid_y)
                         painter.drawLine(x, mid_y, px, mid_y)
                         painter.drawLine(px, mid_y, px, parent_y)
 
             # Draw node
-            color = self._colors[lane % len(self._colors)]
+            color = self._lane_colors.get(lane, BRANCH_COLORS[0])
             painter.setBrush(color)
-            painter.setPen(QPen(color.darker(120), 1))
+            painter.setPen(QPen(color.darker(130), 1.5))
 
             if commit['is_head']:
-                # Draw head as a larger square
-                painter.drawRect(x - self.NODE_RADIUS - 2, y - self.NODE_RADIUS - 2,
-                                 (self.NODE_RADIUS + 2) * 2, (self.NODE_RADIUS + 2) * 2)
+                # HEAD commit: larger rounded rect
+                r = self.NODE_RADIUS + 2
+                painter.drawRoundedRect(x - r, y - r, r * 2, r * 2, 3, 3)
+                # Glow effect
+                painter.setBrush(Qt.NoBrush)
+                glow_pen = QPen(QColor(color.red(), color.green(), color.blue(), 80), 4)
+                painter.setPen(glow_pen)
+                painter.drawRoundedRect(x - r - 2, y - r - 2, r * 2 + 4, r * 2 + 4, 4, 4)
             else:
                 painter.drawEllipse(x - self.NODE_RADIUS, y - self.NODE_RADIUS,
                                     self.NODE_RADIUS * 2, self.NODE_RADIUS * 2)
@@ -130,7 +166,7 @@ class CommitGraphWidget(QWidget):
         painter.end()
 
     def _row_height(self):
-        return 28
+        return 30
 
     def _find_parent_y(self, sha: str) -> int:
         """Find the y position of a parent commit."""
@@ -144,11 +180,11 @@ class CommitGraphWidget(QWidget):
     def sizeHint(self):
         num_lanes = max(self._lanes.values()) + 1 if self._lanes else 1
         width = 20 + num_lanes * self.LANE_WIDTH
-        return QSize(max(60, min(120, width)), 0)
+        return QSize(max(60, min(140, width)), 0)
 
 
 class BranchGraphPanel(QWidget):
-    """Panel showing commit history with branch graph."""
+    """Panel showing colored commit history with branch graph."""
 
     commit_selected = Signal(str)  # commit SHA
     branch_checkout_requested = Signal(str)
@@ -206,11 +242,12 @@ class BranchGraphPanel(QWidget):
         list_layout.addWidget(self._graph_widget)
 
         self._commit_tree = QTreeWidget()
-        self._commit_tree.setHeaderLabels(["SHA", "Author", "Message", "Date", "Tags/Branches"])
-        self._commit_tree.setColumnWidth(0, 80)
-        self._commit_tree.setColumnWidth(1, 150)
-        self._commit_tree.setColumnWidth(3, 160)
-        self._commit_tree.setColumnWidth(4, 150)
+        self._commit_tree.setHeaderLabels(["Graph", "Hash", "Author", "Message", "Date", "Branches / Tags"])
+        self._commit_tree.setColumnWidth(0, 40)
+        self._commit_tree.setColumnWidth(1, 100)
+        self._commit_tree.setColumnWidth(2, 140)
+        self._commit_tree.setColumnWidth(4, 170)
+        self._commit_tree.setColumnWidth(5, 180)
         self._commit_tree.header().setStretchLastSection(True)
         self._commit_tree.setAlternatingRowColors(True)
         self._commit_tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -224,8 +261,15 @@ class BranchGraphPanel(QWidget):
 
         layout.addLayout(list_layout)
 
+    def _lane_color(self, sha: str) -> Optional[QColor]:
+        """Get the lane color for a commit SHA."""
+        lane = self._graph_widget._lanes.get(sha)
+        if lane is not None:
+            return self._graph_widget._lane_colors.get(lane)
+        return None
+
     def refresh(self):
-        """Refresh the commit history."""
+        """Refresh the commit history with colored graph."""
         self._commit_tree.clear()
 
         # Update branch combo
@@ -250,13 +294,45 @@ class BranchGraphPanel(QWidget):
 
         for commit in self._commits:
             item = QTreeWidgetItem()
-            item.setText(0, commit['sha'])
-            item.setText(1, commit['author'])
-            item.setText(2, commit['message'][:80])
-            item.setText(3, commit['datetime'].strftime('%Y-%m-%d %H:%M') if commit['datetime'] else '')
-            item.setData(0, Qt.UserRole, commit['full_sha'])
+            lane_color = self._lane_color(commit['sha'])
 
-            # Tags and branches
+            # Column 0: Graph indicator (colored dot)
+            if lane_color:
+                pix = QPixmap(16, 16)
+                pix.fill(Qt.transparent)
+                p = QPainter(pix)
+                p.setRenderHint(QPainter.Antialiasing)
+                p.setBrush(lane_color)
+                p.setPen(QPen(lane_color.darker(130), 1))
+                p.drawEllipse(2, 2, 12, 12)
+                p.end()
+                item.setIcon(0, QIcon(pix))
+
+            # Column 1: Short hash (colored)
+            item.setText(1, commit['sha'][:7])
+            if lane_color:
+                item.setForeground(1, QBrush(lane_color))
+            font = item.font(1)
+            font.setFamily("monospace")
+            item.setFont(1, font)
+
+            # Column 2: Author
+            item.setText(2, commit['author'])
+
+            # Column 3: Message
+            item.setText(3, commit['message'][:80])
+
+            # Column 4: Date/time
+            if commit['datetime']:
+                dt = commit['datetime']
+                # Relative time for recent commits
+                now = dt.now() if hasattr(dt, 'now') else None
+                item.setText(4, dt.strftime('%Y-%m-%d %H:%M:%S'))
+                item.setToolTip(4, dt.strftime('%A, %B %d, %Y at %H:%M:%S'))
+            else:
+                item.setText(4, '')
+
+            # Column 5: Branches and tags with colored labels
             refs = []
             if commit['is_head']:
                 refs.append('HEAD')
@@ -264,13 +340,23 @@ class BranchGraphPanel(QWidget):
                 refs.append(f"🌿 {b}")
             for t in commit['tags']:
                 refs.append(f"🏷️ {t}")
-            item.setText(4, ', '.join(refs))
+            item.setText(5, '  '.join(refs))
 
-            # Style
+            # Store full SHA
+            item.setData(0, Qt.UserRole, commit['full_sha'])
+
+            # Style: bold for HEAD commit
             if commit['is_head']:
-                font = item.font(0)
-                font.setBold(True)
-                item.setFont(0, font)
+                for col in range(6):
+                    f = item.font(col)
+                    f.setBold(True)
+                    item.setFont(col, f)
+
+            # Background tint for the commit's lane
+            if lane_color:
+                bg = QColor(lane_color.red(), lane_color.green(), lane_color.blue(), 25)
+                for col in range(6):
+                    item.setBackground(col, QBrush(bg))
 
             self._commit_tree.addTopLevelItem(item)
 
@@ -282,9 +368,10 @@ class BranchGraphPanel(QWidget):
         for i in range(self._commit_tree.topLevelItemCount()):
             item = self._commit_tree.topLevelItem(i)
             match = not text or (
-                text.lower() in item.text(0).lower() or
                 text.lower() in item.text(1).lower() or
-                text.lower() in item.text(2).lower()
+                text.lower() in item.text(2).lower() or
+                text.lower() in item.text(3).lower() or
+                text.lower() in item.text(4).lower()
             )
             item.setHidden(not match)
 
@@ -303,7 +390,7 @@ class BranchGraphPanel(QWidget):
         if not sha:
             return
 
-        message = item.text(2)[:50]
+        message = item.text(3)[:50]
 
         mime_data = QMimeData()
         mime_data.setText(f"commit:{sha}")
@@ -313,7 +400,6 @@ class BranchGraphPanel(QWidget):
         drag.setMimeData(mime_data)
 
         # Create a simple drag pixmap
-        from PySide6.QtGui import QPixmap
         pixmap = QPixmap(200, 24)
         pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
