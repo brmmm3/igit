@@ -10,13 +10,14 @@ from PySide6.QtWidgets import (
     QTabWidget, QInputDialog, QApplication, QDockWidget, QListWidget,
     QFrame
 )
-from PySide6.QtCore import Qt, Signal, Slot, QSize, QTimer
+from PySide6.QtCore import Qt, Signal, Slot, QSize, QTimer, QSettings
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QFont
 from PySide6.QtWidgets import QSizePolicy
 
 from ..core.git_operations import GitOperations
 from ..core.undo_manager import UndoManager
 from ..resources.themes import get_theme
+from ..resources import app_icon_path
 from ..widgets.working_copy import WorkingCopyPanel
 from ..widgets.diff_viewer import DiffViewer
 from ..widgets.commit_panel import CommitPanel
@@ -40,18 +41,29 @@ class MainWindow(QMainWindow):
         self._git = GitOperations()
         self._undo_manager = UndoManager(self._git)
         self._dark_mode = False
+        self._recent_repos: list[str] = []
+        self._recent_repo_actions: list[QAction] = []
         self._setup_window()
         self._create_menu_bar()
         self._create_toolbar()
         self._create_central_widget()
         self._create_status_bar()
         self._connect_signals()
+        self._load_recent_repos()
         self._update_title()
 
     def _setup_window(self):
         self.setWindowTitle("iGit")
         self.resize(1280, 800)
         self.setMinimumSize(900, 600)
+
+        # Apply application icon
+        if app_icon_path:
+            icon = QIcon(app_icon_path)
+            self.setWindowIcon(icon)
+            app = QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(icon)
 
     def _create_menu_bar(self):
         menubar = self.menuBar()
@@ -78,6 +90,12 @@ class MainWindow(QMainWindow):
         close_action = QAction("&Close Repository", self)
         close_action.triggered.connect(self._on_close_repo)
         file_menu.addAction(close_action)
+
+        file_menu.addSeparator()
+
+        # Recent repositories submenu
+        self._recent_menu = file_menu.addMenu("&Recent Repositories")
+        self._recent_menu.setEnabled(False)
 
         file_menu.addSeparator()
 
@@ -470,6 +488,7 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Open Repository")
         if path:
             if self._git.open(path):
+                self._add_to_recent_repos(path)
                 self._refresh_all()
             else:
                 QMessageBox.warning(self, "Error", "Not a git repository")
@@ -479,6 +498,7 @@ class MainWindow(QMainWindow):
         if path:
             if self._git.init_repo(path):
                 self._git.open(path)
+                self._add_to_recent_repos(path)
                 self._refresh_all()
             else:
                 QMessageBox.warning(self, "Error", "Failed to initialize repository")
@@ -488,6 +508,7 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             path = dialog.result_path
             if path and self._git.open(path):
+                self._add_to_recent_repos(path)
                 self._refresh_all()
 
     def _on_close_repo(self):
@@ -503,6 +524,85 @@ class MainWindow(QMainWindow):
         self._stash_panel._stash_tree.clear()
         self._remote_panel._remote_tree.clear()
         self._update_title()
+
+    # ── Recent Repositories ────────────────────────────────────
+
+    def _load_recent_repos(self):
+        """Load recent repositories from QSettings."""
+        settings = QSettings("iGit", "iGit")
+        size = settings.beginReadArray("recent_repos")
+        self._recent_repos.clear()
+        for i in range(size):
+            settings.setArrayIndex(i)
+            path = settings.value("path", "")
+            if path and os.path.isdir(path):
+                self._recent_repos.append(path)
+        settings.endArray()
+        self._update_recent_repos_menu()
+
+    def _save_recent_repos(self):
+        """Save recent repositories to QSettings."""
+        settings = QSettings("iGit", "iGit")
+        settings.beginWriteArray("recent_repos")
+        for i, path in enumerate(self._recent_repos):
+            settings.setArrayIndex(i)
+            settings.setValue("path", path)
+        settings.endArray()
+
+    def _add_to_recent_repos(self, path: str):
+        """Add a repository path to the recent list (deduped, max 10)."""
+        if path in self._recent_repos:
+            self._recent_repos.remove(path)
+        self._recent_repos.insert(0, path)
+        self._recent_repos = self._recent_repos[:10]
+        self._save_recent_repos()
+        self._update_recent_repos_menu()
+
+    def _update_recent_repos_menu(self):
+        """Rebuild the recent repositories submenu."""
+        self._recent_menu.clear()
+        if not self._recent_repos:
+            self._recent_menu.setEnabled(False)
+            action = self._recent_menu.addAction("(No recent repositories)")
+            action.setEnabled(False)
+            return
+
+        self._recent_menu.setEnabled(True)
+        for path in self._recent_repos:
+            # Show just the folder name, with full path as tooltip
+            name = os.path.basename(path) or path
+            action = self._recent_menu.addAction(name)
+            action.setToolTip(path)
+            action.setData(path)
+            action.triggered.connect(self._on_open_recent_repo)
+
+        self._recent_menu.addSeparator()
+        clear_action = self._recent_menu.addAction("Clear Recent Repositories")
+        clear_action.triggered.connect(self._on_clear_recent_repos)
+
+    def _on_open_recent_repo(self):
+        """Open a repository from the recent list."""
+        action = self.sender()
+        if not action:
+            return
+        path = action.data()
+        if not path or not os.path.isdir(path):
+            QMessageBox.warning(self, "Error", f"Repository not found:\n{path}")
+            self._recent_repos = [p for p in self._recent_repos if p != path]
+            self._save_recent_repos()
+            self._update_recent_repos_menu()
+            return
+        if self._git.open(path):
+            self._add_to_recent_repos(path)
+            self._refresh_all()
+        else:
+            QMessageBox.warning(self, "Error", "Not a git repository")
+
+    def _on_clear_recent_repos(self):
+        """Clear the recent repositories list."""
+        self._recent_repos.clear()
+        self._save_recent_repos()
+        self._update_recent_repos_menu()
 
     def _on_settings(self):
         dialog = SettingsDialog(self._git, self)
