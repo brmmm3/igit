@@ -494,7 +494,8 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _on_open_repo(self):
-        path = QFileDialog.getExistingDirectory(self, "Open Repository")
+        start_dir = self._git.repo_path if self._git.is_open and self._git.repo_path else ''
+        path = QFileDialog.getExistingDirectory(self, "Open Repository", start_dir)
         if path:
             if self._git.open(path):
                 self._add_to_recent_repos(path)
