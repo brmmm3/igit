@@ -74,6 +74,7 @@ class RemotePanel(QWidget):
         self._remote_tree.setAlternatingRowColors(True)
         self._remote_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._remote_tree.customContextMenuRequested.connect(self._show_context_menu)
+        self._remote_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._remote_tree.setRootIsDecorated(False)
         self._remote_tree.setAcceptDrops(True)
         self._remote_tree.setDragDropMode(QAbstractItemView.DropOnly)
@@ -181,6 +182,40 @@ class RemotePanel(QWidget):
         remove_action.triggered.connect(lambda: self._remove_remote(name))
 
         menu.exec(self._remote_tree.viewport().mapToGlobal(pos))
+
+    def _on_item_double_clicked(self, item, column):
+        """Handle double-click on a remote row to edit name or URL."""
+        name = item.data(0, Qt.UserRole)
+        if not name:
+            return
+
+        if column == 0:
+            # Edit remote name
+            new_name, ok = QInputDialog.getText(
+                self, "Rename Remote",
+                "New remote name:",
+                text=name
+            )
+            if ok and new_name.strip() and new_name.strip() != name:
+                new_name = new_name.strip()
+                if self._git.rename_remote(name, new_name):
+                    self.refresh_requested.emit()
+                else:
+                    QMessageBox.warning(self, "Error", f"Failed to rename remote '{name}'")
+        elif column == 1:
+            # Edit remote URL
+            current_url = item.text(1)
+            new_url, ok = QInputDialog.getText(
+                self, "Edit Remote URL",
+                "New URL:",
+                text=current_url
+            )
+            if ok and new_url.strip() and new_url.strip() != current_url:
+                new_url = new_url.strip()
+                if self._git.set_remote_url(name, new_url):
+                    self.refresh_requested.emit()
+                else:
+                    QMessageBox.warning(self, "Error", f"Failed to update URL for remote '{name}'")
 
     def _on_fetch(self):
         success, error = self._git.fetch()

@@ -25,6 +25,7 @@ from ..widgets.branch_graph import BranchGraphPanel
 from ..widgets.branch_panel import BranchPanel
 from ..widgets.stash_panel import StashPanel
 from ..widgets.remote_panel import RemotePanel
+from ..widgets.statistics_panel import StatisticsPanel
 from ..dialogs.clone_dialog import CloneDialog
 from ..dialogs.settings_dialog import SettingsDialog
 from ..dialogs.conflict_dialog import ConflictDialog
@@ -337,6 +338,9 @@ class MainWindow(QMainWindow):
         self._remote_panel = RemotePanel(self._git)
         left_tabs.addTab(self._remote_panel, "☁️ Remotes")
 
+        self._statistics_panel = StatisticsPanel(self._git)
+        left_tabs.addTab(self._statistics_panel, "📊 Statistics")
+
         left_layout.addWidget(left_tabs)
 
         # Commit panel below
@@ -472,6 +476,7 @@ class MainWindow(QMainWindow):
         self._branch_panel.refresh()
         self._stash_panel.refresh()
         self._remote_panel.refresh()
+        self._statistics_panel.refresh()
         self._update_title()
 
         # Update commit count
@@ -528,6 +533,7 @@ class MainWindow(QMainWindow):
         self._branch_panel._branch_tree.clear()
         self._stash_panel._stash_tree.clear()
         self._remote_panel._remote_tree.clear()
+        self._statistics_panel.refresh()
         self._update_title()
 
     # ── Recent Repositories ────────────────────────────────────

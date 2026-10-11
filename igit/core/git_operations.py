@@ -612,6 +612,14 @@ class GitOperations:
         except (GitCommandError, IndexError):
             return False
 
+    def rename_branch(self, old_name: str, new_name: str) -> bool:
+        """Rename a branch."""
+        try:
+            self.repo.git.branch('-m', old_name, new_name)
+            return True
+        except GitCommandError:
+            return False
+
     def checkout_branch(self, name: str) -> bool:
         """Checkout a branch."""
         try:
@@ -820,6 +828,22 @@ class GitOperations:
             self.repo.delete_remote(remote)
             return True
         except (GitCommandError, IndexError):
+            return False
+
+    def rename_remote(self, old_name: str, new_name: str) -> bool:
+        """Rename a remote."""
+        try:
+            self.repo.git.remote('rename', old_name, new_name)
+            return True
+        except GitCommandError:
+            return False
+
+    def set_remote_url(self, name: str, url: str) -> bool:
+        """Set the URL of a remote."""
+        try:
+            self.repo.git.remote('set-url', name, url)
+            return True
+        except GitCommandError:
             return False
 
     def fetch(self, remote: str = '', prune: bool = False) -> Tuple[bool, str]:
@@ -1216,6 +1240,92 @@ class GitOperations:
         except Exception:
             pass
         return nodes
+
+    def get_repo_statistics(self) -> Dict[str, Any]:
+        """Gather repository-wide statistics including per-user breakdown.
+
+        Returns a dict with:
+          - 'total_commits', 'total_branches', 'total_tags', 'total_files'
+          - 'total_added', 'total_removed', 'total_bytes'
+          - 'first_commit_date', 'last_commit_date'
+          - 'users': list of {name, email, commits, added, removed, files,
+                              bytes, first_date, last_date}
+        """
+        result: Dict[str, Any] = {
+            'total_commits': 0,
+            'total_branches': 0,
+            'total_tags': 0,
+            'total_files': 0,
+            'total_added': 0,
+            'total_removed': 0,
+            'total_bytes': 0,
+            'first_commit_date': None,
+            'last_commit_date': None,
+            'users': [],
+        }
+        if not self.is_open:
+            return result
+
+        try:
+            # Counts
+            result['total_branches'] = len(list(self.repo.branches))
+            result['total_tags'] = len(list(self.repo.tags))
+            result['total_files'] = len(self.repo.git.ls_files().splitlines())
+
+            # Per-user stats via shortlog + per-commit diffs
+            users: Dict[str, Dict[str, Any]] = {}
+            commits = self.get_commits(max_count=10000)
+            result['total_commits'] = len(commits)
+
+            for ci in commits:
+                key = f"{ci.author_name} <{ci.author_email}>"
+                if key not in users:
+                    users[key] = {
+                        'name': ci.author_name,
+                        'email': ci.author_email,
+                        'commits': 0,
+                        'added': 0,
+                        'removed': 0,
+                        'files': 0,
+                        'bytes': 0,
+                        'first_date': ci.authored_datetime,
+                        'last_date': ci.authored_datetime,
+                    }
+                u = users[key]
+                u['commits'] += 1
+                if ci.authored_datetime:
+                    if u['first_date'] is None or ci.authored_datetime < u['first_date']:
+                        u['first_date'] = ci.authored_datetime
+                    if u['last_date'] is None or ci.authored_datetime > u['last_date']:
+                        u['last_date'] = ci.authored_datetime
+
+                # Per-commit diff stats
+                stats = self.get_commit_stats(ci.hexsha)
+                u['added'] += stats.get('total_added', 0)
+                u['removed'] += stats.get('total_removed', 0)
+                u['files'] += stats.get('total_files', 0)
+                u['bytes'] += stats.get('total_bytes', 0)
+
+                # Totals
+                result['total_added'] += stats.get('total_added', 0)
+                result['total_removed'] += stats.get('total_removed', 0)
+                result['total_bytes'] += stats.get('total_bytes', 0)
+
+                # First/last commit dates
+                if ci.authored_datetime:
+                    if result['first_commit_date'] is None or ci.authored_datetime < result['first_commit_date']:
+                        result['first_commit_date'] = ci.authored_datetime
+                    if result['last_commit_date'] is None or ci.authored_datetime > result['last_commit_date']:
+                        result['last_commit_date'] = ci.authored_datetime
+
+            result['users'] = sorted(
+                users.values(),
+                key=lambda u: u['commits'],
+                reverse=True
+            )
+        except Exception:
+            pass
+        return result
 
     def get_unpushed_commits(self) -> List[CommitInfo]:
         """Get commits that haven't been pushed."""
