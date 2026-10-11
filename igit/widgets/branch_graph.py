@@ -187,6 +187,7 @@ class BranchGraphPanel(QWidget):
     """Panel showing colored commit history with branch graph."""
 
     commit_selected = Signal(str)  # commit SHA
+    commit_range_selected = Signal(str, str)  # newest_sha, oldest_sha (selection range)
     branch_checkout_requested = Signal(str)
     branch_merge_requested = Signal(str)
     cherry_pick_requested = Signal(str)
@@ -242,19 +243,20 @@ class BranchGraphPanel(QWidget):
         list_layout.addWidget(self._graph_widget)
 
         self._commit_tree = QTreeWidget()
-        self._commit_tree.setHeaderLabels(["Graph", "Hash", "Author", "Message", "Date", "Branches / Tags"])
+        self._commit_tree.setHeaderLabels(["Graph", "Hash", "Author", "Message", "Date", "Changes", "Branches / Tags"])
         self._commit_tree.setColumnWidth(0, 40)
         self._commit_tree.setColumnWidth(1, 100)
         self._commit_tree.setColumnWidth(2, 140)
         self._commit_tree.setColumnWidth(4, 170)
-        self._commit_tree.setColumnWidth(5, 180)
+        self._commit_tree.setColumnWidth(5, 90)
+        self._commit_tree.setColumnWidth(6, 180)
         self._commit_tree.header().setStretchLastSection(True)
         self._commit_tree.setAlternatingRowColors(True)
         self._commit_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._commit_tree.customContextMenuRequested.connect(self._show_context_menu)
-        self._commit_tree.itemClicked.connect(self._on_item_clicked)
+        self._commit_tree.itemSelectionChanged.connect(self._on_selection_changed)
         self._commit_tree.setRootIsDecorated(False)
-        self._commit_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._commit_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._commit_tree.setDragEnabled(True)
         self._commit_tree.startDrag = self._start_drag
         list_layout.addWidget(self._commit_tree)
@@ -267,6 +269,17 @@ class BranchGraphPanel(QWidget):
         if lane is not None:
             return self._graph_widget._lane_colors.get(lane)
         return None
+
+    @staticmethod
+    def _format_bytes(n: int) -> str:
+        """Format a byte count into a human-readable string."""
+        if n < 1024:
+            return f"{n} B"
+        for unit in ('KB', 'MB', 'GB'):
+            n /= 1024.0
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+        return f"{n:.1f} TB"
 
     def refresh(self):
         """Refresh the commit history with colored graph."""
@@ -332,7 +345,18 @@ class BranchGraphPanel(QWidget):
             else:
                 item.setText(4, '')
 
-            # Column 5: Branches and tags with colored labels
+            # Column 5: Change statistics (+added/-removed)
+            stats = self._git.get_commit_stats(commit['full_sha'])
+            added = stats.get('total_added', 0)
+            removed = stats.get('total_removed', 0)
+            item.setText(5, f"+{added}/-{removed}")
+            item.setToolTip(5, f"{stats.get('total_files', 0)} file(s) changed, "
+                               f"+{added} added, -{removed} removed, "
+                               f"{self._format_bytes(stats.get('total_bytes', 0))}")
+            if added or removed:
+                item.setForeground(5, QBrush(QColor('#1a7f37') if added >= removed else QColor('#cf222e')))
+
+            # Column 6: Branches and tags with colored labels
             refs = []
             if commit['is_head']:
                 refs.append('HEAD')
@@ -340,14 +364,14 @@ class BranchGraphPanel(QWidget):
                 refs.append(f"🌿 {b}")
             for t in commit['tags']:
                 refs.append(f"🏷️ {t}")
-            item.setText(5, '  '.join(refs))
+            item.setText(6, '  '.join(refs))
 
             # Store full SHA
             item.setData(0, Qt.UserRole, commit['full_sha'])
 
             # Style: bold for HEAD commit
             if commit['is_head']:
-                for col in range(6):
+                for col in range(7):
                     f = item.font(col)
                     f.setBold(True)
                     item.setFont(col, f)
@@ -355,7 +379,7 @@ class BranchGraphPanel(QWidget):
             # Background tint for the commit's lane
             if lane_color:
                 bg = QColor(lane_color.red(), lane_color.green(), lane_color.blue(), 25)
-                for col in range(6):
+                for col in range(7):
                     item.setBackground(col, QBrush(bg))
 
             self._commit_tree.addTopLevelItem(item)
@@ -375,10 +399,28 @@ class BranchGraphPanel(QWidget):
             )
             item.setHidden(not match)
 
-    def _on_item_clicked(self, item, column):
-        sha = item.data(0, Qt.UserRole)
-        if sha:
-            self.commit_selected.emit(sha)
+    def _on_selection_changed(self):
+        """Handle single and multi commit selection for the diff."""
+        items = self._commit_tree.selectedItems()
+        if not items:
+            return
+
+        shas = [it.data(0, Qt.UserRole) for it in items if it.data(0, Qt.UserRole)]
+
+        # Single selection: show that commit's diff
+        if len(items) == 1:
+            if shas:
+                self.commit_selected.emit(shas[0])
+            return
+
+        # Multi selection: emit the range (newest..oldest) using their positions
+        # Lower position in the tree = newer commit (topological order).
+        items_sorted = sorted(items, key=lambda it: self._commit_tree.indexOfTopLevelItem(it))
+
+        newest_sha = items_sorted[0].data(0, Qt.UserRole)
+        oldest_sha = items_sorted[-1].data(0, Qt.UserRole)
+        if newest_sha and oldest_sha:
+            self.commit_range_selected.emit(newest_sha, oldest_sha)
 
     def _start_drag(self, actions):
         """Start a drag operation for a commit item."""

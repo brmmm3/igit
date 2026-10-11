@@ -373,12 +373,107 @@ class GitOperations:
         except GitCommandError:
             return ''
 
+    # Canonical empty tree object for diffing the root commit
+    _EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+
+    def _commit_base(self, commit_sha: str) -> str:
+        """Return the diff base for a commit: its parent, or the empty tree
+        if the commit is a root commit (has no parents)."""
+        try:
+            commit = self.repo.commit(commit_sha)
+            if commit.parents:
+                return commit.parents[0].hexsha
+        except Exception:
+            pass
+        return self._EMPTY_TREE
+
     def get_diff_for_commit(self, commit_sha: str) -> str:
         """Get the diff for a specific commit."""
         try:
-            return self.repo.git.show(commit_sha, '--format=""', '--no-stat')
+            base = self._commit_base(commit_sha)
+            return self.repo.git.diff(base, commit_sha)
         except GitCommandError:
             return ''
+
+    def get_diff_for_commit_range(self, newest_sha: str, oldest_sha: str) -> str:
+        """Get the combined diff of a range of commits (oldest..newest).
+
+        Uses the oldest commit's parent (or empty tree for a root commit) as
+        the base, so the diff shows the total change introduced across all
+        selected commits.
+        """
+        try:
+            base = self._commit_base(oldest_sha)
+            return self.repo.git.diff(base, newest_sha)
+        except GitCommandError:
+            return ''
+
+    def get_commit_stats(self, commit_sha: str) -> Dict[str, Any]:
+        """Get change statistics for a single commit.
+
+        Returns a dict with:
+          - 'files': list of {path, added, removed, bytes}
+          - 'total_added', 'total_removed', 'total_files', 'total_bytes'
+        """
+        base = self._commit_base(commit_sha)
+        return self._diff_stats(base, commit_sha)
+
+    def get_commit_range_stats(self, newest_sha: str, oldest_sha: str) -> Dict[str, Any]:
+        """Get change statistics for a range of commits (oldest..newest)."""
+        base = self._commit_base(oldest_sha)
+        return self._diff_stats(base, newest_sha)
+
+    def _diff_stats(self, base: str, target: str) -> Dict[str, Any]:
+        """Compute per-file and total change statistics between two refs."""
+        result: Dict[str, Any] = {
+            'files': [],
+            'total_added': 0,
+            'total_removed': 0,
+            'total_files': 0,
+            'total_bytes': 0,
+        }
+        try:
+            # Per-file added/removed line counts via --numstat
+            numstat = self.repo.git.diff('--numstat', base, target)
+            for line in numstat.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 3:
+                    continue
+                added_s, removed_s, path = parts[0], parts[1], parts[2]
+                if added_s == '-' or removed_s == '-':
+                    # Binary file
+                    added = removed = 0
+                else:
+                    added = int(added_s)
+                    removed = int(removed_s)
+                result['files'].append({
+                    'path': path,
+                    'added': added,
+                    'removed': removed,
+                    'bytes': 0,
+                })
+                result['total_added'] += added
+                result['total_removed'] += removed
+
+            result['total_files'] = len(result['files'])
+
+            # Per-file byte sizes of the target version
+            for f in result['files']:
+                try:
+                    size = int(self.repo.git.cat_file('-s', f'{target}:{f["path"]}'))
+                    f['bytes'] = size
+                    result['total_bytes'] += size
+                except GitCommandError:
+                    # File deleted in target — try the base version
+                    try:
+                        size = int(self.repo.git.cat_file('-s', f'{base}:{f["path"]}'))
+                        f['bytes'] = size
+                        result['total_bytes'] += size
+                    except GitCommandError:
+                        pass
+        except GitCommandError:
+            pass
+        return result
 
     # ── Log / History ───────────────────────────────────────────
 

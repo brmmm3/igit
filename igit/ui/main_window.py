@@ -397,6 +397,7 @@ class MainWindow(QMainWindow):
 
         # Branch graph signals
         self._branch_graph.commit_selected.connect(self._on_commit_selected)
+        self._branch_graph.commit_range_selected.connect(self._on_commit_range_selected)
         self._branch_graph.cherry_pick_requested.connect(self._on_cherry_pick)
         self._branch_graph.revert_requested.connect(self._on_revert)
         self._branch_graph.reset_requested.connect(self._on_reset)
@@ -464,6 +465,9 @@ class MainWindow(QMainWindow):
 
         self._working_copy.refresh()
         self._commit_panel.refresh()
+        # Determine if there are staged changes to commit
+        has_staged = any(fs.staged for fs in self._git.get_file_status())
+        self._commit_panel.set_has_staged_changes(has_staged)
         self._branch_graph.refresh()
         self._branch_panel.refresh()
         self._stash_panel.refresh()
@@ -519,6 +523,7 @@ class MainWindow(QMainWindow):
         self._working_copy._unstaged_tree.clear()
         self._diff_viewer.clear()
         self._commit_panel.clear()
+        self._commit_panel.set_has_staged_changes(False)
         self._branch_graph._commit_tree.clear()
         self._branch_panel._branch_tree.clear()
         self._stash_panel._stash_tree.clear()
@@ -823,6 +828,14 @@ class MainWindow(QMainWindow):
     def _on_commit_selected(self, sha: str):
         diff = self._git.get_diff_for_commit(sha)
         self._diff_viewer.set_diff(diff, f"Commit {sha}")
+        stats = self._git.get_commit_stats(sha)
+        self._diff_viewer.set_stats(stats)
+
+    def _on_commit_range_selected(self, newest_sha: str, oldest_sha: str):
+        diff = self._git.get_diff_for_commit_range(newest_sha, oldest_sha)
+        self._diff_viewer.set_diff(diff, f"Commits {oldest_sha[:7]}..{newest_sha[:7]}")
+        stats = self._git.get_commit_range_stats(newest_sha, oldest_sha)
+        self._diff_viewer.set_stats(stats)
 
     def _on_cherry_pick(self, sha: str):
         old_head = ''
