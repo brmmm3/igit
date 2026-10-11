@@ -126,9 +126,24 @@ class BranchPanel(QWidget):
             self._branch_tree.addTopLevelItem(item)
 
     def _on_double_click(self, item, column):
-        """Checkout branch on double click."""
+        """Checkout or rename branch on double click."""
         name = item.data(0, Qt.UserRole)
-        if name and not name.startswith('☁️'):
+        if not name:
+            return
+        is_remote = item.text(0).startswith('☁️')
+
+        if column == 0 and not is_remote:
+            # Double-click on the name column renames the local branch
+            new_name, ok = QInputDialog.getText(
+                self, "Rename Branch", "New branch name:", text=name
+            )
+            if ok and new_name.strip() and new_name.strip() != name:
+                new_name = new_name.strip()
+                if self._git.rename_branch(name, new_name):
+                    self.refresh_requested.emit()
+                else:
+                    QMessageBox.warning(self, "Error", f"Failed to rename branch '{name}'")
+        elif not is_remote:
             self.branch_checkout_requested.emit(name)
 
     def _show_context_menu(self, pos):

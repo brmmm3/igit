@@ -5,10 +5,35 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QPushButton, QLabel, QHeaderView, QFrame, QGridLayout
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QObject, QRunnable, QThreadPool
 from PySide6.QtGui import QColor, QBrush, QFont
 
 from ..core.git_operations import GitOperations
+
+
+class _StatisticsWorker(QRunnable, QObject):
+    """Compute repository statistics off the UI thread.
+
+    Uses its own GitOperations instance so the shared Repo object is never
+    accessed from a background thread.
+    """
+
+    finished = Signal(object)
+
+    def __init__(self, repo_path: str):
+        QRunnable.__init__(self)
+        QObject.__init__(self)
+        self._repo_path = repo_path
+
+    def run(self):
+        stats: Dict[str, Any] = {}
+        try:
+            ops = GitOperations(self._repo_path)
+            if ops.is_open:
+                stats = ops.get_repo_statistics()
+        except Exception:
+            stats = {}
+        self.finished.emit(stats)
 
 
 class StatisticsPanel(QWidget):
@@ -99,12 +124,38 @@ class StatisticsPanel(QWidget):
         layout.addWidget(self._users_tree)
 
     def refresh(self):
-        """Refresh the statistics display."""
+        """Refresh the statistics display in the background."""
         if not self._git.is_open:
             self._clear_all()
             return
 
-        stats = self._git.get_repo_statistics()
+        # Kick off an async computation so the UI stays responsive.
+        # Track which repo we asked about so stale results can be ignored.
+        self._requested_path = self._git.repo_path
+        worker = _StatisticsWorker(self._requested_path)
+        worker.finished.connect(self._on_stats_ready)
+        self._show_loading()
+        QThreadPool.globalInstance().start(worker)
+
+    def _show_loading(self):
+        """Show loading placeholders while computing in background."""
+        for key in self._overview_labels:
+            self._overview_labels[key].setText('…')
+        self._users_tree.clear()
+        loading = QTreeWidgetItem()
+        loading.setText(0, "Computing statistics…")
+        for col in range(1, 8):
+            loading.setText(col, "")
+        self._users_tree.addTopLevelItem(loading)
+
+    def _on_stats_ready(self, stats):
+        """Receive computed statistics from the worker thread."""
+        # Ignore stale results from a previously opened repository.
+        if self._requested_path != self._git.repo_path:
+            return
+        if not stats or not self._git.is_open:
+            self._clear_all()
+            return
 
         # Overview values
         self._overview_labels['commits'].setText(str(stats.get('total_commits', 0)))
