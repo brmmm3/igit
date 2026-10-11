@@ -1,205 +1,316 @@
-"""Commit history graph with colored branch visualization."""
+"""Commit history with a Git Extensions-style colored graph."""
 
-from typing import List, Dict, Any, Optional
-from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
-    QPushButton, QLabel, QHeaderView, QAbstractItemView, QMenu,
-    QComboBox, QLineEdit, QStyleFactory
+from typing import Any, Dict, List
+
+from PySide6.QtCore import (
+    Qt, Signal, QSize, QMimeData, QPointF,
 )
-from PySide6.QtCore import Qt, Signal, Slot, QSize, QMimeData
 from PySide6.QtGui import (
-    QColor, QBrush, QFont, QPainter, QPen, QIcon, QAction, QDrag,
-    QPixmap, QFontMetrics
+    QColor, QBrush, QPainter, QPen, QDrag, QPixmap,
+)
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QStyledItemDelegate,
+    QPushButton, QLabel, QAbstractItemView, QMenu,
+    QComboBox, QLineEdit,
 )
 
-from ..core.git_operations import GitOperations, CommitInfo
+from ..core.git_operations import GitOperations
 
 
-# ── Color palette for branch lanes ─────────────────────────────
 BRANCH_COLORS = [
-    QColor('#0969da'),  # blue
-    QColor('#1a7f37'),  # green
-    QColor('#9a6700'),  # yellow
-    QColor('#8250df'),  # purple
-    QColor('#cf222e'),  # red
-    QColor('#0550ae'),  # dark blue
-    QColor('#116329'),  # dark green
-    QColor('#953800'),  # orange
-    QColor('#622cbc'),  # dark purple
-    QColor('#a40e26'),  # dark red
-    QColor('#008080'),  # teal
-    QColor('#6e7681'),  # gray
-]
-
-# Lighter versions for backgrounds
-BRANCH_BG_COLORS = [
-    QColor('#ddf4ff'),  # blue bg
-    QColor('#dafbe1'),  # green bg
-    QColor('#fff8c5'),  # yellow bg
-    QColor('#fbefff'),  # purple bg
-    QColor('#ffebe9'),  # red bg
-    QColor('#ddf4ff'),  # dark blue bg
-    QColor('#dafbe1'),  # dark green bg
-    QColor('#fff1e5'),  # orange bg
-    QColor('#fbefff'),  # dark purple bg
-    QColor('#ffebe9'),  # dark red bg
-    QColor('#e6f8f8'),  # teal bg
-    QColor('#f0f6fc'),  # gray bg
+    QColor("#0969da"),
+    QColor("#1a7f37"),
+    QColor("#9a6700"),
+    QColor("#8250df"),
+    QColor("#cf222e"),
+    QColor("#0550ae"),
+    QColor("#116329"),
+    QColor("#953800"),
+    QColor("#622cbc"),
+    QColor("#a40e26"),
+    QColor("#008080"),
+    QColor("#6e7681"),
 ]
 
 
-class CommitGraphWidget(QWidget):
-    """Custom widget that draws the commit graph with colored branch lines."""
+class CommitGraphLayout:
+    """Create row-local segments from pending parent lanes.
 
-    NODE_RADIUS = 6
-    LANE_WIDTH = 22
+    Each active lane stores the SHA of an unvisited parent and its color.
+    Lines are generated from actual ancestry, not from lane min/max rows.
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._commits: List[Dict[str, Any]] = []
-        self._lanes: Dict[str, int] = {}  # sha -> lane index
-        self._lane_colors: Dict[int, QColor] = {}  # lane -> color
-        self.setMinimumWidth(60)
-        self.setMaximumWidth(140)
+    Coordinates use fractional row positions:
+        0.0 = top boundary
+        0.5 = commit center
+        1.0 = bottom boundary
+    """
+
+    LANE_WIDTH = 20
+    PADDING = 8
+
+    def __init__(self):
+        self.rows: List[Dict[str, Any]] = []
+        self.lane_count = 1
+
+    def required_width(self) -> int:
+        return max(
+            40,
+            self.PADDING * 2 + self.lane_count * self.LANE_WIDTH,
+        )
+
+    def lane_x(self, lane: int) -> float:
+        return (
+            self.PADDING
+            + lane * self.LANE_WIDTH
+            + self.LANE_WIDTH / 2
+        )
 
     def set_commits(self, commits: List[Dict[str, Any]]):
-        """Set the commits and compute lane assignments."""
-        self._commits = commits
-        self._compute_lanes()
-        self.update()
+        # Normalize aliases when both short and full SHAs are provided.
+        aliases = {}
+        for commit in commits:
+            sha = commit.get("full_sha") or commit["sha"]
+            aliases[commit["sha"]] = sha
+            aliases[sha] = sha
 
-    def _compute_lanes(self):
-        """Assign each commit to a lane and pick colors."""
-        self._lanes = {}
-        self._lane_colors = {}
-        active_lanes: Dict[int, str] = {}  # lane -> sha still active
+        def canonical(sha):
+            return aliases.get(sha, sha)
+
+        normalized = []
+        for commit in commits:
+            sha = canonical(commit["sha"])
+            parents = list(dict.fromkeys(
+                canonical(parent)
+                for parent in (commit.get("parents") or [])
+            ))
+            normalized.append((sha, parents))
+
+        row_of = {
+            sha: row for row, (sha, _) in enumerate(normalized)
+        }
+
+        if len(row_of) != len(normalized):
+            raise ValueError("Commit graph contains duplicate commits.")
+
+        for row, (_, parents) in enumerate(normalized):
+            for parent in parents:
+                if parent in row_of and row_of[parent] <= row:
+                    raise ValueError(
+                        "Commit graph must use newest-first topological "
+                        "order. Use git log --topo-order."
+                    )
+
+        rows = []
+        lane_count = 1
+        active = {}  # lane -> (pending SHA, color)
         next_color = 0
 
-        for i, commit in enumerate(self._commits):
-            sha = commit['sha']
-            parents = commit['parents']
+        def new_color():
+            nonlocal next_color
+            color = BRANCH_COLORS[next_color % len(BRANCH_COLORS)]
+            next_color += 1
+            return color
 
-            # Try to reuse a parent's lane
-            assigned = False
-            for lane, active_sha in list(active_lanes.items()):
-                if active_sha in parents:
-                    self._lanes[sha] = lane
-                    active_lanes[lane] = sha
-                    assigned = True
-                    break
+        def free_lane(preferred=None):
+            if preferred is not None and preferred not in active:
+                return preferred
+            lane = 0
+            while lane in active:
+                lane += 1
+            return lane
 
-            if not assigned:
-                # Find first free lane
-                used = set(self._lanes.values())
-                lane = 0
-                while lane in used:
-                    lane += 1
-                self._lanes[sha] = lane
-                self._lane_colors[lane] = BRANCH_COLORS[next_color % len(BRANCH_COLORS)]
-                next_color += 1
-                active_lanes[lane] = sha
+        for row_index, (sha, parents) in enumerate(normalized):
+            incoming = dict(active)
+            matching = [
+                lane for lane, (target, _) in incoming.items()
+                if target == sha
+            ]
 
-            # Clean up lanes for merged commits
-            for parent in parents:
-                for lane, active_sha in list(active_lanes.items()):
-                    if active_sha == parent:
-                        still_needed = any(
-                            parent in c['parents']
-                            for c in self._commits[i + 1:]
-                        )
-                        if not still_needed:
-                            del active_lanes[lane]
-                        break
+            if matching:
+                node_lane = min(matching)
+                node_color = incoming[node_lane][1]
+            else:
+                node_lane = free_lane()
+                node_color = new_color()
 
-    def paintEvent(self, event):
-        if not self._commits:
+            # Consume all lanes reaching this commit.
+            for lane in matching:
+                active.pop(lane, None)
+
+            segments = []
+
+            # Unrelated active paths pass through this row unchanged.
+            for lane, (target, color) in incoming.items():
+                if target != sha:
+                    segments.append(
+                        (lane, 0.0, lane, 1.0, color)
+                    )
+
+            # Incoming paths converge on the commit.
+            for lane in matching:
+                segments.append(
+                    (
+                        lane, 0.0,
+                        node_lane, 0.5,
+                        incoming[lane][1],
+                    )
+                )
+
+            # First parent continues the current path if possible.
+            # Other parents either join an existing path or start one.
+            for parent_index, parent in enumerate(parents):
+                existing_lane = next(
+                    (
+                        lane
+                        for lane, (target, _) in active.items()
+                        if target == parent
+                    ),
+                    None,
+                )
+
+                if existing_lane is not None:
+                    parent_lane = existing_lane
+                    parent_color = active[parent_lane][1]
+
+                    # On convergence, retain the arriving path's color
+                    # until it joins the existing parent lane.
+                    edge_color = (
+                        node_color if parent_index == 0
+                        else parent_color
+                    )
+                else:
+                    parent_lane = free_lane(
+                        node_lane if parent_index == 0 else None
+                    )
+                    parent_color = (
+                        node_color if parent_index == 0
+                        else new_color()
+                    )
+                    active[parent_lane] = (parent, parent_color)
+                    edge_color = parent_color
+
+                segments.append(
+                    (
+                        node_lane, 0.5,
+                        parent_lane, 1.0,
+                        edge_color,
+                    )
+                )
+
+            used_lanes = [node_lane]
+            used_lanes.extend(incoming.keys())
+            used_lanes.extend(active.keys())
+            lane_count = max(lane_count, max(used_lanes) + 1)
+
+            rows.append({
+                "lane": node_lane,
+                "color": node_color,
+                "segments": segments,
+                "is_head": bool(commits[row_index].get("is_head")),
+            })
+
+        self.rows = rows
+        self.lane_count = lane_count
+
+
+class CommitGraphDelegate(QStyledItemDelegate):
+    """Paint graph segments directly in the tree's Graph column."""
+
+    ROW_ROLE = Qt.ItemDataRole.UserRole + 1
+    NODE_RADIUS = 4.0
+    ROW_HEIGHT = 28
+
+    def __init__(self, graph: CommitGraphLayout, parent=None):
+        super().__init__(parent)
+        self._graph = graph
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        return QSize(size.width(), max(size.height(), self.ROW_HEIGHT))
+
+    def paint(self, painter, option, index):
+        # Paint normal background, including selection.
+        super().paint(painter, option, index)
+
+        if index.column() != 0:
             return
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        row_index = index.data(self.ROW_ROLE)
+        if row_index is None:
+            return
 
-        height = self._row_height()
-        padding = 10
+        row_index = int(row_index)
+        if not 0 <= row_index < len(self._graph.rows):
+            return
 
-        for i, commit in enumerate(self._commits):
-            y = padding + i * height + height // 2
-            sha = commit['sha']
-            lane = self._lanes.get(sha, 0)
-            x = padding + lane * self.LANE_WIDTH + self.LANE_WIDTH // 2
+        row = self._graph.rows[row_index]
+        rect = option.rect
 
-            # Draw lines to parents
-            for parent in commit['parents']:
-                parent_lane = self._lanes.get(parent)
-                if parent_lane is not None:
-                    parent_y = self._find_parent_y(parent)
-                    if parent_y > y:
-                        px = padding + parent_lane * self.LANE_WIDTH + self.LANE_WIDTH // 2
-                        color = self._lane_colors.get(lane, BRANCH_COLORS[0])
+        # Use y + height for the boundary shared with the next row.
+        top = float(rect.y())
+        height = float(rect.height())
 
-                        pen = QPen(color, 2.5)
-                        painter.setPen(pen)
+        def point(lane, fraction):
+            return QPointF(
+                rect.x() + self._graph.lane_x(lane),
+                top + fraction * height,
+            )
 
-                        # Draw connecting lines
-                        mid_y = (y + parent_y) // 2
-                        painter.drawLine(x, y, x, mid_y)
-                        painter.drawLine(x, mid_y, px, mid_y)
-                        painter.drawLine(px, mid_y, px, parent_y)
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-            # Draw node
-            color = self._lane_colors.get(lane, BRANCH_COLORS[0])
-            painter.setBrush(color)
-            painter.setPen(QPen(color.darker(130), 1.5))
+        # Draw all edges before drawing the node.
+        for lane_a, y_a, lane_b, y_b, color in row["segments"]:
+            pen = QPen(color, 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.drawLine(
+                point(lane_a, y_a),
+                point(lane_b, y_b),
+            )
 
-            if commit['is_head']:
-                # HEAD commit: larger rounded rect
-                r = self.NODE_RADIUS + 2
-                painter.drawRoundedRect(x - r, y - r, r * 2, r * 2, 3, 3)
-                # Glow effect
-                painter.setBrush(Qt.NoBrush)
-                glow_pen = QPen(QColor(color.red(), color.green(), color.blue(), 80), 4)
-                painter.setPen(glow_pen)
-                painter.drawRoundedRect(x - r - 2, y - r - 2, r * 2 + 4, r * 2 + 4, 4, 4)
-            else:
-                painter.drawEllipse(x - self.NODE_RADIUS, y - self.NODE_RADIUS,
-                                    self.NODE_RADIUS * 2, self.NODE_RADIUS * 2)
+        center = point(row["lane"], 0.5)
+        color = row["color"]
+        radius = self.NODE_RADIUS + (1 if row["is_head"] else 0)
 
-        painter.end()
+        painter.setPen(QPen(color.darker(140), 1.0))
+        painter.setBrush(color)
+        painter.drawEllipse(center, radius, radius)
 
-    def _row_height(self):
-        return 30
+        if row["is_head"]:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(option.palette.base())
+            painter.drawEllipse(
+                center,
+                self.NODE_RADIUS - 1,
+                self.NODE_RADIUS - 1,
+            )
 
-    def _find_parent_y(self, sha: str) -> int:
-        """Find the y position of a parent commit."""
-        height = self._row_height()
-        padding = 10
-        for i, commit in enumerate(self._commits):
-            if commit['sha'] == sha:
-                return padding + i * height + height // 2
-        return 0
-
-    def sizeHint(self):
-        num_lanes = max(self._lanes.values()) + 1 if self._lanes else 1
-        width = 20 + num_lanes * self.LANE_WIDTH
-        return QSize(max(60, min(140, width)), 0)
+        painter.restore()
 
 
 class BranchGraphPanel(QWidget):
-    """Panel showing colored commit history with branch graph."""
+    """Panel showing commit history with colored ancestry lanes."""
 
-    commit_selected = Signal(str)  # commit SHA
-    commit_range_selected = Signal(str, str)  # newest_sha, oldest_sha (selection range)
+    commit_selected = Signal(str)
+    commit_range_selected = Signal(str, str)
     branch_checkout_requested = Signal(str)
     branch_merge_requested = Signal(str)
     cherry_pick_requested = Signal(str)
     revert_requested = Signal(str)
-    reset_requested = Signal(str, str)  # sha, mode
-    create_tag_requested = Signal(str, str)  # sha, name
-    create_branch_requested = Signal(str, str)  # sha, name
+    reset_requested = Signal(str, str)
+    create_tag_requested = Signal(str, str)
+    create_branch_requested = Signal(str, str)
 
     def __init__(self, git_ops: GitOperations, parent=None):
         super().__init__(parent)
         self._git = git_ops
         self._commits: List[Dict[str, Any]] = []
+        self._commit_totals = {}
+        self._graph = CommitGraphLayout()
         self._setup_ui()
 
     def _setup_ui(self):
@@ -207,7 +318,6 @@ class BranchGraphPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        # Toolbar
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(8, 8, 8, 0)
 
@@ -217,16 +327,19 @@ class BranchGraphPanel(QWidget):
 
         self._branch_combo = QComboBox()
         self._branch_combo.setMinimumWidth(200)
-        self._branch_combo.currentTextChanged.connect(self._on_branch_changed)
+        self._branch_combo.currentTextChanged.connect(
+            self._on_branch_changed
+        )
         toolbar.addWidget(self._branch_combo)
 
         self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search commits...")
+        self._search_edit.setPlaceholderText("Highlight commits...")
         self._search_edit.setMaximumWidth(200)
         self._search_edit.textChanged.connect(self._on_search)
         toolbar.addWidget(self._search_edit)
 
         self._refresh_btn = QPushButton("🔄")
+        self._refresh_btn.setToolTip("Refresh history")
         self._refresh_btn.setMaximumWidth(32)
         self._refresh_btn.clicked.connect(self.refresh)
         toolbar.addWidget(self._refresh_btn)
@@ -234,204 +347,288 @@ class BranchGraphPanel(QWidget):
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
-        # Commit list with graph
-        list_layout = QHBoxLayout()
-        list_layout.setContentsMargins(0, 0, 0, 0)
-        list_layout.setSpacing(0)
-
-        self._graph_widget = CommitGraphWidget()
-        list_layout.addWidget(self._graph_widget)
-
         self._commit_tree = QTreeWidget()
-        self._commit_tree.setHeaderLabels(["Graph", "Hash", "Author", "Message", "Date", "Changes", "Branches / Tags"])
-        self._commit_tree.setColumnWidth(0, 40)
-        self._commit_tree.setColumnWidth(1, 100)
-        self._commit_tree.setColumnWidth(2, 140)
-        self._commit_tree.setColumnWidth(4, 170)
-        self._commit_tree.setColumnWidth(5, 90)
-        self._commit_tree.setColumnWidth(6, 180)
-        self._commit_tree.header().setStretchLastSection(True)
-        self._commit_tree.setAlternatingRowColors(True)
-        self._commit_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._commit_tree.customContextMenuRequested.connect(self._show_context_menu)
-        self._commit_tree.itemSelectionChanged.connect(self._on_selection_changed)
+        self._commit_tree.setHeaderLabels([
+            "Graph",
+            "Hash",
+            "Author",
+            "Message",
+            "Date",
+            "Changes",
+            "Branches / Tags",
+        ])
+
+        self._commit_tree.setUniformRowHeights(True)
         self._commit_tree.setRootIsDecorated(False)
-        self._commit_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._commit_tree.setIndentation(0)
+        self._commit_tree.setSortingEnabled(False)
+        self._commit_tree.setAlternatingRowColors(True)
+        self._commit_tree.setWordWrap(False)
+
+        self._commit_tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self._commit_tree.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._commit_tree.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._commit_tree.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+
+        self._commit_tree.setColumnWidth(0, 60)
+        self._commit_tree.setColumnWidth(1, 90)
+        self._commit_tree.setColumnWidth(2, 140)
+        self._commit_tree.setColumnWidth(3, 350)
+        self._commit_tree.setColumnWidth(4, 160)
+        self._commit_tree.setColumnWidth(5, 100)
+        self._commit_tree.header().setStretchLastSection(True)
+        self._commit_tree.header().setSectionsMovable(False)
+
+        self._graph_delegate = CommitGraphDelegate(
+            self._graph, self._commit_tree
+        )
+        self._commit_tree.setItemDelegate(self._graph_delegate)
+
+        self._commit_tree.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self._commit_tree.customContextMenuRequested.connect(
+            self._show_context_menu
+        )
+        self._commit_tree.itemSelectionChanged.connect(
+            self._on_selection_changed
+        )
+
         self._commit_tree.setDragEnabled(True)
         self._commit_tree.startDrag = self._start_drag
-        list_layout.addWidget(self._commit_tree)
 
-        layout.addLayout(list_layout)
-
-    def _lane_color(self, sha: str) -> Optional[QColor]:
-        """Get the lane color for a commit SHA."""
-        lane = self._graph_widget._lanes.get(sha)
-        if lane is not None:
-            return self._graph_widget._lane_colors.get(lane)
-        return None
+        layout.addWidget(self._commit_tree, 1)
 
     @staticmethod
     def _format_bytes(n: int) -> str:
-        """Format a byte count into a human-readable string."""
         if n < 1024:
             return f"{n} B"
-        for unit in ('KB', 'MB', 'GB'):
-            n /= 1024.0
-            if n < 1024:
-                return f"{n:.1f} {unit}"
-        return f"{n:.1f} TB"
+
+        value = float(n)
+        for unit in ("KB", "MB", "GB"):
+            value /= 1024.0
+            if value < 1024:
+                return f"{value:.1f} {unit}"
+
+        return f"{value / 1024.0:.1f} TB"
 
     def refresh(self):
-        """Refresh the commit history with colored graph."""
-        self._commit_tree.clear()
-
-        # Update branch combo
+        """Load history without reordering its topological sequence."""
         current = self._branch_combo.currentText()
+
         self._branch_combo.blockSignals(True)
-        self._branch_combo.clear()
-        self._branch_combo.addItem("All Branches")
-        for b in self._git.get_branches():
-            if not b.is_remote:
-                self._branch_combo.addItem(b.name)
-        if current:
-            idx = self._branch_combo.findText(current)
-            if idx >= 0:
-                self._branch_combo.setCurrentIndex(idx)
-        self._branch_combo.blockSignals(False)
+        try:
+            self._branch_combo.clear()
+            self._branch_combo.addItem("All Branches")
 
-        # Get commits
-        branch = '' if self._branch_combo.currentIndex() == 0 else self._branch_combo.currentText()
-        self._commits = self._git.get_commit_graph(branch=branch, max_count=200)
-        # Aggregate change totals for all commits in one call (avoids a git
-        # process per commit, which made opening the repo very slow).
-        self._commit_totals = self._git.get_commit_totals_bulk(max_count=200, branch=branch)
+            for branch_info in self._git.get_branches():
+                if not branch_info.is_remote:
+                    self._branch_combo.addItem(branch_info.name)
 
-        self._graph_widget.set_commits(self._commits)
+            if current:
+                index = self._branch_combo.findText(current)
+                if index >= 0:
+                    self._branch_combo.setCurrentIndex(index)
+        finally:
+            self._branch_combo.blockSignals(False)
 
-        for commit in self._commits:
-            item = QTreeWidgetItem()
-            lane_color = self._lane_color(commit['sha'])
+        branch = (
+            ""
+            if self._branch_combo.currentIndex() == 0
+            else self._branch_combo.currentText()
+        )
 
-            # Column 0: Graph indicator (colored dot)
-            if lane_color:
-                pix = QPixmap(16, 16)
-                pix.fill(Qt.transparent)
-                p = QPainter(pix)
-                p.setRenderHint(QPainter.Antialiasing)
-                p.setBrush(lane_color)
-                p.setPen(QPen(lane_color.darker(130), 1))
-                p.drawEllipse(2, 2, 12, 12)
-                p.end()
-                item.setIcon(0, QIcon(pix))
+        commits = self._git.get_commit_graph(
+            branch=branch,
+            max_count=200,
+        )
+        totals = self._git.get_commit_totals_bulk(
+            max_count=200,
+            branch=branch,
+        )
 
-            # Column 1: Short hash (colored)
-            item.setText(1, commit['sha'][:7])
-            if lane_color:
-                item.setForeground(1, QBrush(lane_color))
-            font = item.font(1)
-            font.setFamily("monospace")
-            item.setFont(1, font)
+        # Validate and build before replacing the displayed history.
+        self._graph.set_commits(commits)
+        self._commits = commits
+        self._commit_totals = totals
 
-            # Column 2: Author
-            item.setText(2, commit['author'])
+        self._commit_tree.setUpdatesEnabled(False)
+        self._commit_tree.blockSignals(True)
 
-            # Column 3: Message
-            item.setText(3, commit['message'][:80])
+        try:
+            self._commit_tree.clear()
+            self._commit_tree.setColumnWidth(
+                0, self._graph.required_width()
+            )
 
-            # Column 4: Date/time
-            if commit['datetime']:
-                dt = commit['datetime']
-                # Relative time for recent commits
-                now = dt.now() if hasattr(dt, 'now') else None
-                item.setText(4, dt.strftime('%Y-%m-%d %H:%M:%S'))
-                item.setToolTip(4, dt.strftime('%A, %B %d, %Y at %H:%M:%S'))
-            else:
-                item.setText(4, '')
+            for row, commit in enumerate(self._commits):
+                item = QTreeWidgetItem()
+                sha = commit.get("full_sha") or commit["sha"]
+                color = self._graph.rows[row]["color"]
 
-            # Column 5: Change statistics (+added/-removed) from bulk totals
-            stats = self._commit_totals.get(commit['sha'], {})
-            added = stats.get('added', 0)
-            removed = stats.get('removed', 0)
-            files = stats.get('files', 0)
-            item.setText(5, f"+{added}/-{removed}")
-            item.setToolTip(5, f"{files} file(s) changed, "
-                               f"+{added} added, -{removed} removed")
-            if added or removed:
-                item.setForeground(5, QBrush(QColor('#1a7f37') if added >= removed else QColor('#cf222e')))
+                item.setData(0, Qt.ItemDataRole.UserRole, sha)
+                item.setData(0, CommitGraphDelegate.ROW_ROLE, row)
 
-            # Column 6: Branches and tags with colored labels
-            refs = []
-            if commit['is_head']:
-                refs.append('HEAD')
-            for b in commit['branches']:
-                refs.append(f"🌿 {b}")
-            for t in commit['tags']:
-                refs.append(f"🏷️ {t}")
-            item.setText(6, '  '.join(refs))
+                item.setText(1, commit["sha"][:7])
+                item.setToolTip(1, sha)
+                item.setForeground(1, QBrush(color))
 
-            # Store full SHA
-            item.setData(0, Qt.UserRole, commit['full_sha'])
+                font = item.font(1)
+                font.setFamily("monospace")
+                item.setFont(1, font)
 
-            # Style: bold for HEAD commit
-            if commit['is_head']:
-                for col in range(7):
-                    f = item.font(col)
-                    f.setBold(True)
-                    item.setFont(col, f)
+                author = commit.get("author") or ""
+                item.setText(2, author)
+                item.setToolTip(2, author)
 
-            # Background tint for the commit's lane
-            if lane_color:
-                bg = QColor(lane_color.red(), lane_color.green(), lane_color.blue(), 25)
-                for col in range(7):
-                    item.setBackground(col, QBrush(bg))
+                message = commit.get("message") or ""
+                subject = message.splitlines()[0] if message else ""
+                item.setText(3, subject)
+                item.setToolTip(3, message)
 
-            self._commit_tree.addTopLevelItem(item)
+                dt = commit.get("datetime")
+                if dt is not None:
+                    item.setText(4, dt.strftime("%Y-%m-%d %H:%M:%S"))
+                    item.setToolTip(
+                        4, dt.strftime("%A, %B %d, %Y at %H:%M:%S")
+                    )
+
+                stats = self._commit_totals.get(sha)
+                if stats is None:
+                    stats = self._commit_totals.get(commit["sha"], {})
+
+                added = stats.get("added", 0)
+                removed = stats.get("removed", 0)
+                files = stats.get("files", 0)
+
+                item.setText(5, f"+{added}/-{removed}")
+                item.setToolTip(
+                    5,
+                    f"{files} file(s) changed, "
+                    f"+{added} added, -{removed} removed",
+                )
+
+                if added or removed:
+                    item.setForeground(
+                        5,
+                        QBrush(QColor(
+                            "#1a7f37"
+                            if added >= removed
+                            else "#cf222e"
+                        )),
+                    )
+
+                refs = []
+                if commit.get("is_head"):
+                    refs.append("HEAD")
+
+                refs.extend(
+                    f"🌿 {name}"
+                    for name in (commit.get("branches") or [])
+                )
+                refs.extend(
+                    f"🏷️ {name}"
+                    for name in (commit.get("tags") or [])
+                )
+
+                item.setText(6, "  ".join(refs))
+                item.setToolTip(6, "\n".join(refs))
+
+                if commit.get("is_head"):
+                    for column in range(7):
+                        font = item.font(column)
+                        font.setBold(True)
+                        item.setFont(column, font)
+
+                self._commit_tree.addTopLevelItem(item)
+
+            self._on_search(self._search_edit.text())
+        finally:
+            self._commit_tree.blockSignals(False)
+            self._commit_tree.setUpdatesEnabled(True)
+
+        self._commit_tree.viewport().update()
 
     def _on_branch_changed(self, branch: str):
         self.refresh()
 
     def _on_search(self, text: str):
-        """Filter commits by search text."""
-        for i in range(self._commit_tree.topLevelItemCount()):
-            item = self._commit_tree.topLevelItem(i)
-            match = not text or (
-                text.lower() in item.text(1).lower() or
-                text.lower() in item.text(2).lower() or
-                text.lower() in item.text(3).lower() or
-                text.lower() in item.text(4).lower()
+        """Highlight matches without hiding ancestry rows.
+
+        Hiding intermediate commits would break graph continuity.
+        """
+        query = text.strip().casefold()
+        first_match = None
+
+        for row in range(self._commit_tree.topLevelItemCount()):
+            item = self._commit_tree.topLevelItem(row)
+            item.setHidden(False)
+
+            searchable = [
+                item.text(column) for column in range(1, 7)
+            ]
+            searchable.extend([
+                str(item.data(0, Qt.ItemDataRole.UserRole) or ""),
+                item.toolTip(3),
+            ])
+
+            matches = bool(query) and any(
+                query in value.casefold()
+                for value in searchable
             )
-            item.setHidden(not match)
+
+            background = (
+                QBrush(QColor(255, 210, 70, 90))
+                if matches else QBrush()
+            )
+
+            for column in range(7):
+                item.setBackground(column, background)
+
+            if matches and first_match is None:
+                first_match = item
+
+        if first_match is not None:
+            self._commit_tree.scrollToItem(
+                first_match,
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
 
     def _on_selection_changed(self):
-        """Handle single and multi commit selection for the diff."""
         items = self._commit_tree.selectedItems()
         if not items:
             return
 
-        shas = [it.data(0, Qt.UserRole) for it in items if it.data(0, Qt.UserRole)]
+        items = sorted(
+            items,
+            key=self._commit_tree.indexOfTopLevelItem,
+        )
 
-        # Single selection: show that commit's diff
-        if len(items) == 1:
-            if shas:
-                self.commit_selected.emit(shas[0])
-            return
+        shas = [
+            item.data(0, Qt.ItemDataRole.UserRole)
+            for item in items
+        ]
+        shas = [sha for sha in shas if sha]
 
-        # Multi selection: emit the range (newest..oldest) using their positions
-        # Lower position in the tree = newer commit (topological order).
-        items_sorted = sorted(items, key=lambda it: self._commit_tree.indexOfTopLevelItem(it))
-
-        newest_sha = items_sorted[0].data(0, Qt.UserRole)
-        oldest_sha = items_sorted[-1].data(0, Qt.UserRole)
-        if newest_sha and oldest_sha:
-            self.commit_range_selected.emit(newest_sha, oldest_sha)
+        if len(shas) == 1:
+            self.commit_selected.emit(shas[0])
+        elif len(shas) > 1:
+            self.commit_range_selected.emit(shas[0], shas[-1])
 
     def _start_drag(self, actions):
-        """Start a drag operation for a commit item."""
         item = self._commit_tree.currentItem()
-        if not item:
+        if item is None:
             return
 
-        sha = item.data(0, Qt.UserRole)
+        sha = item.data(0, Qt.ItemDataRole.UserRole)
         if not sha:
             return
 
@@ -439,61 +636,87 @@ class BranchGraphPanel(QWidget):
 
         mime_data = QMimeData()
         mime_data.setText(f"commit:{sha}")
-        mime_data.setData('application/x-igit-commit', sha.encode('utf-8'))
+        mime_data.setData(
+            "application/x-igit-commit",
+            sha.encode("utf-8"),
+        )
 
         drag = QDrag(self._commit_tree)
         drag.setMimeData(mime_data)
 
-        # Create a simple drag pixmap
-        pixmap = QPixmap(200, 24)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setPen(QColor('#0969da'))
-        painter.drawText(4, 17, f"📝 {sha[:7]} {message}")
-        painter.end()
-        drag.setPixmap(pixmap)
+        pixmap = QPixmap(300, 24)
+        pixmap.fill(Qt.GlobalColor.transparent)
 
-        drag.exec(Qt.MoveAction | Qt.CopyAction)
+        painter = QPainter(pixmap)
+        painter.setPen(QColor("#0969da"))
+        painter.drawText(4, 17, f"{sha[:7]} {message}")
+        painter.end()
+
+        drag.setPixmap(pixmap)
+        drag.exec(actions)
 
     def _show_context_menu(self, pos):
         item = self._commit_tree.itemAt(pos)
-        if not item:
+        if item is None:
             return
 
-        sha = item.data(0, Qt.UserRole)
+        sha = item.data(0, Qt.ItemDataRole.UserRole)
+        if not sha:
+            return
+
         menu = QMenu(self)
 
-        checkout_action = menu.addAction("Checkout")
-        checkout_action.triggered.connect(lambda: self._git.checkout_commit(sha))
-
-        menu.addSeparator()
-
-        cherry_pick_action = menu.addAction("Cherry-Pick")
-        cherry_pick_action.triggered.connect(lambda: self.cherry_pick_requested.emit(sha))
-
-        revert_action = menu.addAction("Revert")
-        revert_action.triggered.connect(lambda: self.revert_requested.emit(sha))
-
-        menu.addSeparator()
-
-        create_branch_action = menu.addAction("Create Branch Here...")
-        create_branch_action.triggered.connect(
-            lambda: self.create_branch_requested.emit(sha, '')
+        action = menu.addAction("Checkout")
+        action.triggered.connect(
+            lambda checked=False: self._git.checkout_commit(sha)
         )
 
-        create_tag_action = menu.addAction("Create Tag Here...")
-        create_tag_action.triggered.connect(
-            lambda: self.create_tag_requested.emit(sha, '')
+        menu.addSeparator()
+
+        action = menu.addAction("Cherry-Pick")
+        action.triggered.connect(
+            lambda checked=False: self.cherry_pick_requested.emit(sha)
+        )
+
+        action = menu.addAction("Revert")
+        action.triggered.connect(
+            lambda checked=False: self.revert_requested.emit(sha)
+        )
+
+        menu.addSeparator()
+
+        action = menu.addAction("Create Branch Here...")
+        action.triggered.connect(
+            lambda checked=False:
+            self.create_branch_requested.emit(sha, "")
+        )
+
+        action = menu.addAction("Create Tag Here...")
+        action.triggered.connect(
+            lambda checked=False:
+            self.create_tag_requested.emit(sha, "")
         )
 
         menu.addSeparator()
 
         reset_menu = menu.addMenu("Reset to Here")
-        soft_action = reset_menu.addAction("Soft (keep changes staged)")
-        soft_action.triggered.connect(lambda: self.reset_requested.emit(sha, '--soft'))
-        mixed_action = reset_menu.addAction("Mixed (keep changes unstaged)")
-        mixed_action.triggered.connect(lambda: self.reset_requested.emit(sha, '--mixed'))
-        hard_action = reset_menu.addAction("Hard (discard all changes)")
-        hard_action.triggered.connect(lambda: self.reset_requested.emit(sha, '--hard'))
+
+        action = reset_menu.addAction("Soft (keep changes staged)")
+        action.triggered.connect(
+            lambda checked=False:
+            self.reset_requested.emit(sha, "--soft")
+        )
+
+        action = reset_menu.addAction("Mixed (keep changes unstaged)")
+        action.triggered.connect(
+            lambda checked=False:
+            self.reset_requested.emit(sha, "--mixed")
+        )
+
+        action = reset_menu.addAction("Hard (discard all changes)")
+        action.triggered.connect(
+            lambda checked=False:
+            self.reset_requested.emit(sha, "--hard")
+        )
 
         menu.exec(self._commit_tree.viewport().mapToGlobal(pos))

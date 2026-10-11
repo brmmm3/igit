@@ -42,6 +42,14 @@ def main():
             git = GitOperations()
             if git.open(repo_path):
                 window._git = git
+                # Update all panels with the new git instance
+                window._working_copy._git = git
+                window._commit_panel._git = git
+                window._branch_panel._git = git
+                window._stash_panel._git = git
+                window._remote_panel._git = git
+                window._statistics_panel._git = git
+                window._branch_graph._git = git
                 window._connect_signals()
                 window._refresh_all()
 
