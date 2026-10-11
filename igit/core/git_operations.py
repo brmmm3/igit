@@ -571,12 +571,8 @@ class GitOperations:
                     commit_sha=b.commit.hexsha[:7]
                 ))
 
-            # Remote branches
+            # Remote branches (from locally cached refs; no network fetch here)
             for r in self.repo.remotes:
-                try:
-                    r.fetch()
-                except Exception:
-                    pass
                 for ref in r.refs:
                     name = ref.remote_head
                     if name and name != 'HEAD':
