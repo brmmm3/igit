@@ -18,6 +18,7 @@ class CommitPanel(QWidget):
     def __init__(self, git_ops: GitOperations, parent=None):
         super().__init__(parent)
         self._git = git_ops
+        self._has_staged_changes = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -35,6 +36,7 @@ class CommitPanel(QWidget):
         self._message_edit.setPlaceholderText("Commit message...")
         self._message_edit.setMinimumHeight(100)
         self._message_edit.setMaximumHeight(200)
+        self._message_edit.textChanged.connect(self._update_commit_button)
         layout.addWidget(self._message_edit)
 
         # Description
@@ -65,6 +67,7 @@ class CommitPanel(QWidget):
         options_layout.addWidget(self._gpg_check)
 
         self._amend_check = QCheckBox("Amend")
+        self._amend_check.toggled.connect(self._update_commit_button)
         options_layout.addWidget(self._amend_check)
 
         options_layout.addStretch()
@@ -104,6 +107,18 @@ class CommitPanel(QWidget):
                 self._author_combo.insertItem(0, entry)
                 self._author_combo.setCurrentIndex(0)
 
+    def set_has_staged_changes(self, has_staged: bool):
+        """Set whether there are staged changes available to commit."""
+        self._has_staged_changes = has_staged
+        self._update_commit_button()
+
+    def _update_commit_button(self):
+        """Enable the commit button only when there is something to commit
+        and a commit message has been entered."""
+        has_message = bool(self._message_edit.toPlainText().strip())
+        can_commit = (self._has_staged_changes or self._amend_check.isChecked()) and has_message
+        self._commit_btn.setEnabled(can_commit)
+
     def _on_commit(self):
         """Handle commit button click."""
         message = self._message_edit.toPlainText().strip()
@@ -127,6 +142,7 @@ class CommitPanel(QWidget):
         self._message_edit.clear()
         self._description_edit.clear()
         self._status_label.setText("")
+        self._update_commit_button()
 
     def set_status(self, status: str):
         """Set the status label."""
@@ -135,3 +151,4 @@ class CommitPanel(QWidget):
     def set_amend_mode(self, amend: bool):
         """Toggle amend mode."""
         self._amend_check.setChecked(amend)
+        self._update_commit_button()

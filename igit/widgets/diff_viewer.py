@@ -178,6 +178,15 @@ class DiffViewer(QWidget):
 
         layout.addLayout(toolbar)
 
+        # Stats bar
+        stats_bar = QHBoxLayout()
+        stats_bar.setContentsMargins(8, 0, 8, 4)
+        self._stats_label = QLabel("")
+        self._stats_label.setObjectName("statsLabel")
+        stats_bar.addWidget(self._stats_label)
+        stats_bar.addStretch()
+        layout.addLayout(stats_bar)
+
         # Diff editor
         self._editor = DiffEditor()
         self._highlighter = DiffHighlighter(self._editor.document(), self._dark_mode)
@@ -193,6 +202,36 @@ class DiffViewer(QWidget):
         self._editor.moveCursor(QTextCursor.Start)
         self._stage_hunk_btn.setEnabled(bool(diff_text))
         self._discard_hunk_btn.setEnabled(bool(diff_text))
+        self._stats_label.setText("")
+
+    def set_stats(self, stats: dict):
+        """Display change statistics (added/removed lines, files, bytes)."""
+        if not stats:
+            self._stats_label.setText("")
+            return
+        files = stats.get('files', [])
+        added = stats.get('total_added', 0)
+        removed = stats.get('total_removed', 0)
+        total_files = stats.get('total_files', len(files))
+        total_bytes = stats.get('total_bytes', 0)
+
+        parts = []
+        parts.append(f"<b>{total_files}</b> file{'s' if total_files != 1 else ''} changed")
+        parts.append(f"<span style='color:#1a7f37'>+{added}</span>")
+        parts.append(f"<span style='color:#cf222e'>-{removed}</span>")
+        parts.append(f"<b>{self._format_bytes(total_bytes)}</b>")
+        self._stats_label.setText("  ".join(parts))
+
+    @staticmethod
+    def _format_bytes(n: int) -> str:
+        """Format a byte count into a human-readable string."""
+        if n < 1024:
+            return f"{n} B"
+        for unit in ('KB', 'MB', 'GB'):
+            n /= 1024.0
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+        return f"{n:.1f} TB"
 
     def _parse_hunks(self, diff_text: str):
         """Parse hunk headers from diff text."""
@@ -242,6 +281,7 @@ class DiffViewer(QWidget):
         self._hunk_ranges = []
         self._stage_hunk_btn.setEnabled(False)
         self._discard_hunk_btn.setEnabled(False)
+        self._stats_label.setText("")
 
     def set_dark_mode(self, dark: bool):
         """Update dark mode."""

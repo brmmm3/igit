@@ -836,6 +836,28 @@ class MainWindow(QMainWindow):
         self._diff_viewer.set_diff(diff, f"Commits {oldest_sha[:7]}..{newest_sha[:7]}")
         stats = self._git.get_commit_range_stats(newest_sha, oldest_sha)
         self._diff_viewer.set_stats(stats)
+        # Show statistics in the status bar
+        files = stats.get('total_files', 0)
+        added = stats.get('total_added', 0)
+        removed = stats.get('total_removed', 0)
+        bytes_total = stats.get('total_bytes', 0)
+        self._status_bar.showMessage(
+            f"📊 {files} file{'s' if files != 1 else ''} changed, "
+            f"+{added} added, -{removed} removed, "
+            f"{self._format_bytes(bytes_total)}",
+            8000
+        )
+
+    @staticmethod
+    def _format_bytes(n: int) -> str:
+        """Format a byte count into a human-readable string."""
+        if n < 1024:
+            return f"{n} B"
+        for unit in ('KB', 'MB', 'GB'):
+            n /= 1024.0
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+        return f"{n:.1f} TB"
 
     def _on_cherry_pick(self, sha: str):
         old_head = ''
