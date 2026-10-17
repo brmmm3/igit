@@ -3,19 +3,25 @@
 import re
 from typing import Optional, List, Tuple, Callable
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPlainTextEdit, QPushButton,
     QLabel, QSplitter, QComboBox, QToolBar, QToolButton,
     QScrollBar, QFrame, QMenu, QCheckBox
 )
 from PySide6.QtCore import Qt, Signal, Slot, QRect, QSize
 from PySide6.QtGui import (
     QFont, QColor, QTextCursor, QTextCharFormat, QSyntaxHighlighter,
-    QPainter, QTextFormat, QAction, QKeySequence, QBrush, QPen
+    QPainter, QTextFormat, QAction, QKeySequence, QBrush, QPen,
+    QFontDatabase
 )
 
 
 class DiffHighlighter(QSyntaxHighlighter):
-    """Syntax highlighter for unified diff output."""
+    """Syntax highlighter for unified diff output.
+
+    Only touches text attributes (bold headers, italic commit info). The
+    full-line add/remove/hunk backgrounds are painted by DiffEditor through
+    extra selections so they span the entire viewport width.
+    """
 
     def __init__(self, parent=None, dark_mode: bool = False):
         super().__init__(parent)
@@ -24,29 +30,21 @@ class DiffHighlighter(QSyntaxHighlighter):
 
     def _build_rules(self):
         rules = []
-        bg = self.dark_mode
+        dark = self.dark_mode
 
-        # Header lines (---, +++, @@)
         header_fmt = QTextCharFormat()
-        header_fmt.setForeground(QColor('#569cd6' if bg else '#0550ae'))
+        header_fmt.setForeground(QColor('#569cd6' if dark else '#000080'))
         header_fmt.setFontWeight(700)
+        rules.append((r'^diff --git .*', header_fmt))
         rules.append((r'^--- .*', header_fmt))
         rules.append((r'^\+\+\+ .*', header_fmt))
-        rules.append((r'^@@ -.*', header_fmt))
 
-        # Added lines
-        add_fmt = QTextCharFormat()
-        add_fmt.setForeground(QColor('#4ec9b0' if bg else '#116329'))
-        rules.append((r'^\+.*', add_fmt))
+        hunk_fmt = QTextCharFormat()
+        hunk_fmt.setForeground(QColor('#9cdcfe' if dark else '#444444'))
+        rules.append((r'^@@ -.*', hunk_fmt))
 
-        # Removed lines
-        rem_fmt = QTextCharFormat()
-        rem_fmt.setForeground(QColor('#f14c4c' if bg else '#cf222e'))
-        rules.append((r'^-.*', rem_fmt))
-
-        # Commit info
         info_fmt = QTextCharFormat()
-        info_fmt.setForeground(QColor('#6a9955' if bg else '#1a7f37'))
+        info_fmt.setForeground(QColor('#6a9955' if dark else '#1a7f37'))
         info_fmt.setFontItalic(True)
         rules.append((r'^commit .*', info_fmt))
         rules.append((r'^Author: .*', info_fmt))
@@ -60,8 +58,50 @@ class DiffHighlighter(QSyntaxHighlighter):
                 self.setFormat(match.start(), match.end() - match.start(), fmt)
 
 
+_HUNK_RE = re.compile(r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@')
+
+
+def compute_line_numbers(diff_text: str):
+    """Return (old, new, kind) per line of a unified diff.
+
+    kind is one of 'file', 'hunk', 'add', 'del', 'ctx', 'meta'.
+    old/new are ints or None.
+    """
+    result = []
+    old = new = 0
+    in_hunk = False
+    for line in diff_text.split('\n'):
+        m = _HUNK_RE.match(line)
+        if m:
+            old, new = int(m.group(1)), int(m.group(2))
+            in_hunk = True
+            result.append((None, None, 'hunk'))
+            continue
+        if line.startswith('diff --git') or line.startswith('commit '):
+            in_hunk = False
+            result.append((None, None, 'file'))
+            continue
+        if not in_hunk:
+            kind = 'file' if line.startswith(('--- ', '+++ ')) else 'meta'
+            result.append((None, None, kind))
+            continue
+        if line.startswith('+'):
+            result.append((None, new, 'add'))
+            new += 1
+        elif line.startswith('-'):
+            result.append((old, None, 'del'))
+            old += 1
+        elif line.startswith('\\'):
+            result.append((None, None, 'meta'))
+        else:
+            result.append((old, new, 'ctx'))
+            old += 1
+            new += 1
+    return result
+
+
 class LineNumberArea(QWidget):
-    """Line number area for the diff viewer."""
+    """Two-column (old/new) line number gutter for the diff editor."""
 
     def __init__(self, editor):
         super().__init__(editor)
@@ -74,27 +114,107 @@ class LineNumberArea(QWidget):
         self._editor.line_number_area_paint_event(event)
 
 
-class DiffEditor(QTextEdit):
-    """Custom QTextEdit for diff display with line numbers."""
+class DiffEditor(QPlainTextEdit):
+    """Read-only diff view with old/new line numbers and coloured lines."""
 
-    def __init__(self, parent=None):
+    LIGHT = {
+        'add': '#d4f5d4', 'del': '#f9d3d3', 'hunk': '#e3e3e3',
+        'file': '#f0f0f0',
+        'gutter': '#f0f0f0', 'gutter_add': '#b9e8b9', 'gutter_del': '#f2b8b8',
+        'gutter_fg': '#808080', 'gutter_line': '#c8c8c8',
+    }
+    DARK = {
+        'add': '#1f3d28', 'del': '#4a2326', 'hunk': '#2d2d30',
+        'file': '#252526',
+        'gutter': '#252526', 'gutter_add': '#2b5a38', 'gutter_del': '#6b2f33',
+        'gutter_fg': '#858585', 'gutter_line': '#3c3c3c',
+    }
+
+    def __init__(self, parent=None, dark_mode: bool = False):
         super().__init__(parent)
+        self._dark = dark_mode
+        self._numbers = []
         self.setReadOnly(True)
-        self.setFont(QFont("SF Mono", 10))
+        self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        font.setPointSize(10)
+        self.setFont(font)
         self.setTabStopDistance(32)
         self._line_number_area = LineNumberArea(self)
-        self.document().blockCountChanged.connect(self._update_line_number_width)
-        self.verticalScrollBar().valueChanged.connect(
-            self._line_number_area.update
-        )
+        self.blockCountChanged.connect(self._update_line_number_width)
+        self.updateRequest.connect(self._update_line_number_area)
         self._update_line_number_width()
 
+    def _colors(self):
+        return self.DARK if self._dark else self.LIGHT
+
+    def set_dark_mode(self, dark: bool):
+        self._dark = dark
+        self._apply_line_backgrounds()
+        self._line_number_area.update()
+
+    def set_diff_text(self, text: str):
+        self._numbers = compute_line_numbers(text) if text else []
+        self.setPlainText(text)
+        self._update_line_number_width()
+        self._apply_line_backgrounds()
+        self._line_number_area.update()
+
+    def clear_diff(self):
+        self._numbers = []
+        self.clear()
+        self.setExtraSelections([])
+
+    # ── backgrounds ──────────────────────────────────────────
+
+    def _apply_line_backgrounds(self):
+        colors = self._colors()
+        selections = []
+        doc = self.document()
+        for i, (_, _, kind) in enumerate(self._numbers):
+            key = {'add': 'add', 'del': 'del', 'hunk': 'hunk',
+                   'file': 'file'}.get(kind)
+            if key is None:
+                continue
+            block = doc.findBlockByNumber(i)
+            if not block.isValid():
+                break
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(QColor(colors[key]))
+            sel.format.setProperty(QTextFormat.FullWidthSelection, True)
+            cursor = QTextCursor(block)
+            sel.cursor = cursor
+            selections.append(sel)
+        self.setExtraSelections(selections)
+
+    # ── gutter ───────────────────────────────────────────────
+
+    def _digits(self):
+        mx = 1
+        for old, new, _ in self._numbers:
+            if old and old > mx:
+                mx = old
+            if new and new > mx:
+                mx = new
+        return max(3, len(str(mx)))
+
+    def _column_width(self):
+        return 12 + self.fontMetrics().horizontalAdvance('9') * self._digits()
+
     def line_number_width(self):
-        digits = len(str(max(1, self.document().blockCount())))
-        return 10 + 8 * digits
+        return self._column_width() * 2 + 2
 
     def _update_line_number_width(self):
         self.setViewportMargins(self.line_number_width(), 0, 0, 0)
+
+    def _update_line_number_area(self, rect, dy):
+        if dy:
+            self._line_number_area.scroll(0, dy)
+        else:
+            self._line_number_area.update(
+                0, rect.y(), self._line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_line_number_width()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -104,33 +224,51 @@ class DiffEditor(QTextEdit):
         )
 
     def line_number_area_paint_event(self, event):
+        colors = self._colors()
         painter = QPainter(self._line_number_area)
-        painter.fillRect(event.rect(), QColor('#f6f8fa'))
+        painter.fillRect(event.rect(), QColor(colors['gutter']))
+        painter.setFont(self.font())
 
-        block = self.document().begin()
-        block_number = 1
-        top = self.document().documentLayout().blockBoundingRect(block).top()
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor('#8b949e'))
+        col_w = self._column_width()
+        total_w = self._line_number_area.width()
 
-        while block.isValid():
-            if block.isVisible():
-                pos = self.document().documentLayout().blockBoundingRect(block).top()
-                if pos >= event.rect().top() - 100 and pos <= event.rect().bottom() + 100:
-                    painter.setPen(QColor('#8b949e'))
-                    painter.drawText(
-                        0, round(pos), self.line_number_width() - 5,
-                        self.fontMetrics().height(),
-                        Qt.AlignRight, str(block_number)
-                    )
-                block_number += 1
+        block = self.firstVisibleBlock()
+        number = block.blockNumber()
+        top = round(self.blockBoundingGeometry(block)
+                    .translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                if number < len(self._numbers):
+                    old, new, kind = self._numbers[number]
+                    h = self.fontMetrics().height()
+                    if kind == 'add':
+                        painter.fillRect(col_w, top, col_w, bottom - top,
+                                         QColor(colors['gutter_add']))
+                    elif kind == 'del':
+                        painter.fillRect(0, top, col_w, bottom - top,
+                                         QColor(colors['gutter_del']))
+                    elif kind == 'hunk':
+                        painter.fillRect(0, top, total_w, bottom - top,
+                                         QColor(colors['hunk']))
+                    painter.setPen(QColor(colors['gutter_fg']))
+                    if old is not None:
+                        painter.drawText(0, top, col_w - 6, h,
+                                         Qt.AlignRight, str(old))
+                    if new is not None:
+                        painter.drawText(col_w, top, col_w - 6, h,
+                                         Qt.AlignRight, str(new))
             block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            number += 1
 
+        painter.setPen(QColor(colors['gutter_line']))
+        painter.drawLine(col_w, event.rect().top(), col_w, event.rect().bottom())
+        painter.drawLine(total_w - 1, event.rect().top(),
+                         total_w - 1, event.rect().bottom())
         painter.end()
-
-    def wheelEvent(self, event):
-        super().wheelEvent(event)
-        self._line_number_area.update()
 
 
 class DiffViewer(QWidget):
@@ -188,7 +326,7 @@ class DiffViewer(QWidget):
         layout.addLayout(stats_bar)
 
         # Diff editor
-        self._editor = DiffEditor()
+        self._editor = DiffEditor(dark_mode=self._dark_mode)
         self._highlighter = DiffHighlighter(self._editor.document(), self._dark_mode)
         layout.addWidget(self._editor)
 
@@ -198,7 +336,7 @@ class DiffViewer(QWidget):
         self._current_path = file_path
         self._file_label.setText(file_path or "Diff View")
         self._parse_hunks(diff_text)
-        self._editor.setPlainText(diff_text)
+        self._editor.set_diff_text(diff_text)
         self._editor.moveCursor(QTextCursor.Start)
         self._stage_hunk_btn.setEnabled(bool(diff_text))
         self._discard_hunk_btn.setEnabled(bool(diff_text))
@@ -268,13 +406,13 @@ class DiffViewer(QWidget):
 
     def _on_toggle_wrap(self, checked: bool):
         if checked:
-            self._editor.setLineWrapMode(QTextEdit.WidgetWidth)
+            self._editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         else:
-            self._editor.setLineWrapMode(QTextEdit.NoWrap)
+            self._editor.setLineWrapMode(QPlainTextEdit.NoWrap)
 
     def clear(self):
         """Clear the diff view."""
-        self._editor.clear()
+        self._editor.clear_diff()
         self._file_label.setText("No file selected")
         self._current_path = ''
         self._current_diff = ''
@@ -286,5 +424,7 @@ class DiffViewer(QWidget):
     def set_dark_mode(self, dark: bool):
         """Update dark mode."""
         self._dark_mode = dark
+        self._highlighter.setDocument(None)
         self._highlighter = DiffHighlighter(self._editor.document(), dark)
         self._highlighter.rehighlight()
+        self._editor.set_dark_mode(dark)

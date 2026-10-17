@@ -395,6 +395,23 @@ class GitOperations:
         except GitCommandError:
             return ''
 
+    def get_diff_for_commit_file(self, commit_sha: str, path: str) -> str:
+        """Get the diff of a single file within a commit."""
+        try:
+            base = self._commit_base(commit_sha)
+            return self.repo.git.diff(base, commit_sha, '--', path)
+        except GitCommandError:
+            return ''
+
+    def get_diff_for_commit_range_file(self, newest_sha: str, oldest_sha: str,
+                                       path: str) -> str:
+        """Get the diff of a single file over a commit range."""
+        try:
+            base = self._commit_base(oldest_sha)
+            return self.repo.git.diff(base, newest_sha, '--', path)
+        except GitCommandError:
+            return ''
+
     def get_diff_for_commit_range(self, newest_sha: str, oldest_sha: str) -> str:
         """Get the combined diff of a range of commits (oldest..newest).
 
@@ -1245,39 +1262,49 @@ class GitOperations:
             if branch:
                 kwargs['rev'] = branch
 
+            # Build ref lookup tables once instead of per commit.
+            branch_map: Dict[str, List[str]] = {}
+            remote_map: Dict[str, List[str]] = {}
+            tag_map: Dict[str, List[str]] = {}
+            try:
+                for b in self.repo.branches:
+                    branch_map.setdefault(b.commit.hexsha, []).append(b.name)
+            except Exception:
+                pass
+            try:
+                for r in self.repo.remotes:
+                    for ref in r.refs:
+                        rname = ref.remote_head
+                        if rname and rname != 'HEAD':
+                            remote_map.setdefault(ref.commit.hexsha, []).append(
+                                f"{r.name}/{rname}")
+            except Exception:
+                pass
+            try:
+                for t in self.repo.tags:
+                    tag_map.setdefault(t.commit.hexsha, []).append(t.name)
+            except Exception:
+                pass
+            head_sha = ''
+            try:
+                if self.repo.head.is_valid():
+                    head_sha = self.repo.head.commit.hexsha
+            except Exception:
+                pass
+
             for commit in self.repo.iter_commits(**kwargs):
-                node = {
+                nodes.append({
                     'sha': commit.hexsha[:7],
                     'full_sha': commit.hexsha,
                     'message': commit.summary,
                     'author': commit.author.name,
                     'datetime': commit.authored_datetime,
                     'parents': [p.hexsha[:7] for p in commit.parents],
-                    'branches': [],
-                    'tags': [],
-                    'is_head': False,
-                }
-                # Check branches
-                try:
-                    for b in self.repo.branches:
-                        if b.commit == commit:
-                            node['branches'].append(b.name)
-                except Exception:
-                    pass
-                # Check tags
-                try:
-                    for t in self.repo.tags:
-                        if t.commit == commit:
-                            node['tags'].append(t.name)
-                except Exception:
-                    pass
-                # Check HEAD
-                try:
-                    if self.repo.head.is_valid() and commit == self.repo.head.commit:
-                        node['is_head'] = True
-                except Exception:
-                    pass
-                nodes.append(node)
+                    'branches': list(branch_map.get(commit.hexsha, [])),
+                    'remote_branches': list(remote_map.get(commit.hexsha, [])),
+                    'tags': list(tag_map.get(commit.hexsha, [])),
+                    'is_head': commit.hexsha == head_sha,
+                })
         except Exception:
             pass
         return nodes

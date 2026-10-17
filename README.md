@@ -67,6 +67,7 @@ A feature-rich Git GUI client built with Python and PySide6, inspired by [Git To
 - Push tags to remote
 
 ### Advanced Features
+- **Integrated Git console** for running any Git CLI subcommand in the open repository (without shell interpretation)
 - **Cherry-pick** commits
 - **Revert** commits
 - **Reset** (soft, mixed, hard)
@@ -116,6 +117,7 @@ python main.py /path/to/repo
 | `Ctrl+Shift+F` | Fetch |
 | `Ctrl+Shift+P` | Pull |
 | `Ctrl+Shift+U` | Push |
+| `Ctrl+Shift+G` | Open Git Console |
 | `F5` | Refresh |
 | `Ctrl+D` | Toggle dark mode |
 

@@ -1,6 +1,7 @@
 """Main application window for iGit."""
 
 import os
+import shlex
 import sys
 from typing import Optional
 from PySide6.QtWidgets import (
@@ -8,10 +9,10 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QPushButton, QLabel, QStatusBar,
     QMenuBar, QMenu, QToolBar, QToolButton, QFileDialog, QMessageBox,
     QTabWidget, QInputDialog, QApplication, QDockWidget, QListWidget,
-    QFrame
+    QFrame, QLineEdit, QComboBox, QPlainTextEdit
 )
-from PySide6.QtCore import Qt, Signal, Slot, QSize, QTimer, QSettings
-from PySide6.QtGui import QAction, QKeySequence, QIcon, QFont
+from PySide6.QtCore import Qt, Signal, Slot, QSize, QTimer, QSettings, QProcess
+from PySide6.QtGui import QAction, QKeySequence, QIcon, QFont, QColor
 from PySide6.QtWidgets import QSizePolicy
 
 from ..core.git_operations import GitOperations
@@ -70,7 +71,7 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
 
         # File menu
-        file_menu = menubar.addMenu("&File")
+        file_menu = menubar.addMenu("&Start")
 
         open_action = QAction("&Open Repository...", self)
         open_action.setShortcut(QKeySequence("Ctrl+O"))
@@ -113,7 +114,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         # Edit menu
-        edit_menu = menubar.addMenu("&Edit")
+        edit_menu = menubar.addMenu("&Commands")
 
         self._undo_action = QAction("&Undo", self)
         self._undo_action.setShortcut(QKeySequence.Undo)
@@ -160,7 +161,7 @@ class MainWindow(QMainWindow):
         repo_menu.addAction(refresh_action)
 
         # Branch menu
-        branch_menu = menubar.addMenu("&Branch")
+        branch_menu = menubar.addMenu("&Navigate")
 
         new_branch_action = QAction("&New Branch...", self)
         new_branch_action.triggered.connect(self._on_new_branch)
@@ -178,8 +179,9 @@ class MainWindow(QMainWindow):
         interactive_rebase_action.triggered.connect(self._on_interactive_rebase)
         branch_menu.addAction(interactive_rebase_action)
 
-        # Commit menu
-        commit_menu = menubar.addMenu("&Commit")
+        # Commit and stash commands share the Commands menu.
+        commit_menu = edit_menu
+        commit_menu.addSeparator()
 
         commit_action = QAction("&Commit...", self)
         commit_action.setShortcut(QKeySequence("Ctrl+Return"))
@@ -214,12 +216,36 @@ class MainWindow(QMainWindow):
         show_reflog_action.triggered.connect(self._on_show_reflog)
         view_menu.addAction(show_reflog_action)
 
+        console_action = QAction("Git &Console", self)
+        console_action.setShortcut(QKeySequence("Ctrl+Shift+G"))
+        console_action.triggered.connect(self._show_git_console)
+        view_menu.addAction(console_action)
+
+        # Screenshot-aligned service/plugin/tool menu placeholders.
+        github_menu = menubar.addMenu("&GitHub")
+        plugins_menu = menubar.addMenu("&Plugins")
+        tools_menu = menubar.addMenu("&Tools")
+        dark_action = QAction("Toggle Dark Mode", self)
+        dark_action.triggered.connect(self._toggle_dark_mode)
+        tools_menu.addAction(dark_action)
+        tools_menu.addAction("Settings...").triggered.connect(self._on_settings)
+
         # Help menu
         help_menu = menubar.addMenu("&Help")
 
         about_action = QAction("&About iGit", self)
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
+
+        # Present the same top-level menu sequence as Git Extensions.
+        ordered_menus = (
+            repo_menu, branch_menu, view_menu, edit_menu,
+            github_menu, plugins_menu, tools_menu,
+        )
+        for menu in ordered_menus:
+            menubar.removeAction(menu.menuAction())
+        for menu in ordered_menus:
+            menubar.insertMenu(help_menu.menuAction(), menu)
 
     def _create_toolbar(self):
         toolbar = QToolBar("Main Toolbar")
@@ -265,11 +291,16 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        commit_btn = QToolButton()
-        commit_btn.setText("✅ Commit")
-        commit_btn.setObjectName("primaryButton")
-        commit_btn.clicked.connect(self._on_commit)
-        toolbar.addWidget(commit_btn)
+        self._commit_btn = QToolButton()
+        self._commit_btn.setText("Commit")
+        self._commit_btn.setObjectName("primaryButton")
+        self._commit_btn.setToolTip("Commit staged changes (Ctrl+Enter)")
+        self._commit_btn.clicked.connect(self._on_commit)
+        toolbar.addWidget(self._commit_btn)
+
+        self._stash_count_label = QLabel("Stash: 0")
+        self._stash_count_label.setObjectName("statusLabel")
+        toolbar.addWidget(self._stash_count_label)
 
         toolbar.addSeparator()
 
@@ -296,10 +327,25 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(spacer)
 
         # Branch indicator
+        self._repo_path_label = QLabel("No repository")
+        self._repo_path_label.setObjectName("statusLabel")
+        self._repo_path_label.setMaximumWidth(280)
+        self._repo_path_label.setToolTip("Repository path")
+        toolbar.addWidget(self._repo_path_label)
+
         self._branch_label = QLabel("No repo")
         self._branch_label.setObjectName("statusLabel")
         self._branch_label.setStyleSheet("padding: 0 8px;")
         toolbar.addWidget(self._branch_label)
+
+        self._toolbar_branch_combo = QComboBox()
+        self._toolbar_branch_combo.setMinimumWidth(150)
+        self._toolbar_branch_combo.setMaximumWidth(220)
+        self._toolbar_branch_combo.setToolTip("Checkout branch")
+        self._toolbar_branch_combo.activated.connect(
+            self._on_toolbar_branch_selected
+        )
+        toolbar.addWidget(self._toolbar_branch_combo)
 
         # Dark mode toggle
         dark_btn = QToolButton()
@@ -316,56 +362,140 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Main splitter: left sidebar | center | right sidebar
+        # Sidebar retains the existing Changes / Branches / Stashes / Remotes
+        # panels and their signal-facing private widget attributes.
         self._main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
 
-        # Left panel: Working Copy + Commit
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(0)
+        self._sidebar_tabs = QTabWidget()
+        branch_sidebar = QWidget()
+        branch_layout = QVBoxLayout(branch_sidebar)
+        branch_layout.setContentsMargins(4, 4, 4, 4)
+        branch_layout.setSpacing(4)
+        self._branch_search = QLineEdit()
+        self._branch_search.setPlaceholderText("Search branches...")
+        self._branch_search.textChanged.connect(self._filter_branch_sidebar)
+        branch_layout.addWidget(self._branch_search)
+        self._branch_sidebar_tree = QTreeWidget()
+        self._branch_sidebar_tree.setHeaderHidden(True)
+        self._branch_sidebar_tree.setRootIsDecorated(True)
+        self._branch_sidebar_tree.setUniformRowHeights(True)
+        self._branch_sidebar_tree.itemDoubleClicked.connect(
+            self._on_branch_sidebar_activated
+        )
+        branch_layout.addWidget(self._branch_sidebar_tree, 1)
+        self._sidebar_tabs.addTab(branch_sidebar, "Branches")
 
-        left_tabs = QTabWidget()
         self._working_copy = WorkingCopyPanel(self._git)
-        left_tabs.addTab(self._working_copy, "📝 Changes")
-
+        self._sidebar_tabs.addTab(self._working_copy, "Changes")
         self._branch_panel = BranchPanel(self._git)
-        left_tabs.addTab(self._branch_panel, "🌿 Branches")
-
+        self._sidebar_tabs.addTab(self._branch_panel, "Manage")
         self._stash_panel = StashPanel(self._git)
-        left_tabs.addTab(self._stash_panel, "📦 Stashes")
-
+        self._sidebar_tabs.addTab(self._stash_panel, "Stashes")
         self._remote_panel = RemotePanel(self._git)
-        left_tabs.addTab(self._remote_panel, "☁️ Remotes")
+        self._sidebar_tabs.addTab(self._remote_panel, "Remotes")
+        self._sidebar_tabs.setMinimumWidth(220)
+        self._main_splitter.addWidget(self._sidebar_tabs)
+
+        # Right side: history above the tabbed commit/diff/detail workspace.
+        self._right_splitter = QSplitter(Qt.Vertical)
+        self._right_splitter.setChildrenCollapsible(False)
+
+        self._branch_graph = BranchGraphPanel(self._git)
+        self._right_splitter.addWidget(self._branch_graph)
+
+        self._bottom_tabs = QTabWidget()
+        self._commit_panel = CommitPanel(self._git)
+        self._bottom_tabs.addTab(self._commit_panel, "Commit")
+
+        self._diff_viewer = DiffViewer(self, self._dark_mode)
+        diff_tab = QWidget()
+        diff_layout = QVBoxLayout(diff_tab)
+        diff_layout.setContentsMargins(2, 2, 2, 2)
+        diff_layout.setSpacing(2)
+        diff_controls = QHBoxLayout()
+        self._diff_file_filter = QLineEdit()
+        self._diff_file_filter.setPlaceholderText("Filter files...")
+        self._diff_file_filter.textChanged.connect(self._filter_diff_files)
+        diff_controls.addWidget(self._diff_file_filter, 1)
+        self._diff_with_combo = QComboBox()
+        self._diff_with_combo.setMinimumWidth(180)
+        self._diff_with_combo.setToolTip("Diff with selected revision")
+        diff_controls.addWidget(self._diff_with_combo)
+        diff_layout.addLayout(diff_controls)
+        diff_splitter = QSplitter(Qt.Horizontal)
+        self._diff_file_list = QListWidget()
+        self._diff_file_list.setMinimumWidth(160)
+        self._diff_file_list.currentTextChanged.connect(
+            self._on_diff_file_list_selected
+        )
+        diff_splitter.addWidget(self._diff_file_list)
+        diff_splitter.addWidget(self._diff_viewer)
+        diff_splitter.setSizes([220, 780])
+        diff_layout.addWidget(diff_splitter, 1)
+        self._bottom_tabs.addTab(diff_tab, "Diff")
+
+        self._file_tree = QTreeWidget()
+        self._file_tree.setHeaderLabels(["File", "Added", "Removed"])
+        self._file_tree.setRootIsDecorated(False)
+        self._file_tree.setAlternatingRowColors(False)
+        self._bottom_tabs.addTab(self._file_tree, "File tree")
+
+        self._gpg_panel = QLabel("GPG signature information appears for signed commits.")
+        self._gpg_panel.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._bottom_tabs.addTab(self._gpg_panel, "GPG")
+
+        console_panel = QWidget()
+        console_layout = QVBoxLayout(console_panel)
+        console_layout.setContentsMargins(4, 4, 4, 4)
+        console_layout.setSpacing(4)
+        self._console_view = QPlainTextEdit()
+        self._console_view.setReadOnly(True)
+        self._console_view.setPlaceholderText(
+            "Run Git commands here. Commands execute in the open repository; shell syntax is not evaluated."
+        )
+        console_layout.addWidget(self._console_view, 1)
+        console_controls = QHBoxLayout()
+        self._console_input = QLineEdit()
+        self._console_input.setPlaceholderText("git status --short")
+        self._console_input.returnPressed.connect(self._run_git_console_command)
+        console_controls.addWidget(self._console_input, 1)
+        self._console_run_button = QPushButton("Run")
+        self._console_run_button.clicked.connect(self._run_git_console_command)
+        console_controls.addWidget(self._console_run_button)
+        self._console_stop_button = QPushButton("Stop")
+        self._console_stop_button.setEnabled(False)
+        self._console_stop_button.clicked.connect(self._stop_git_console_command)
+        console_controls.addWidget(self._console_stop_button)
+        console_layout.addLayout(console_controls)
+        self._console_process = QProcess(self)
+        self._console_process.readyReadStandardOutput.connect(
+            self._read_git_console_stdout
+        )
+        self._console_process.readyReadStandardError.connect(
+            self._read_git_console_stderr
+        )
+        self._console_process.finished.connect(self._git_console_finished)
+        self._console_process.errorOccurred.connect(self._git_console_error)
+        self._bottom_tabs.addTab(console_panel, "Console")
+
+        self._build_report_view = QPlainTextEdit()
+        self._build_report_view.setReadOnly(True)
+        self._build_report_view.setPlaceholderText("No build report available")
+        self._bottom_tabs.addTab(self._build_report_view, "Build Report")
 
         self._statistics_panel = StatisticsPanel(self._git)
-        left_tabs.addTab(self._statistics_panel, "📊 Statistics")
+        self._bottom_tabs.addTab(self._statistics_panel, "Statistics")
 
-        left_layout.addWidget(left_tabs)
+        self._right_splitter.addWidget(self._bottom_tabs)
+        self._right_splitter.setSizes([520, 280])
+        self._right_splitter.setStretchFactor(0, 3)
+        self._right_splitter.setStretchFactor(1, 2)
 
-        # Commit panel below
-        self._commit_panel = CommitPanel(self._git)
-        left_layout.addWidget(self._commit_panel)
-
-        self._main_splitter.addWidget(left_widget)
-
-        # Center: Diff viewer
-        center_tabs = QTabWidget()
-        self._diff_viewer = DiffViewer(self, self._dark_mode)
-        center_tabs.addTab(self._diff_viewer, "📄 Diff")
-
-        self._main_splitter.addWidget(center_tabs)
-
-        # Right: History graph
-        self._branch_graph = BranchGraphPanel(self._git)
-        self._main_splitter.addWidget(self._branch_graph)
-
-        # Set sizes
-        self._main_splitter.setSizes([350, 450, 400])
+        self._main_splitter.addWidget(self._right_splitter)
+        self._main_splitter.setSizes([270, 1010])
         self._main_splitter.setStretchFactor(0, 0)
         self._main_splitter.setStretchFactor(1, 1)
-        self._main_splitter.setStretchFactor(2, 0)
-
         main_layout.addWidget(self._main_splitter)
 
     def _create_status_bar(self):
@@ -402,6 +532,7 @@ class MainWindow(QMainWindow):
         # Branch graph signals
         self._branch_graph.commit_selected.connect(self._on_commit_selected)
         self._branch_graph.commit_range_selected.connect(self._on_commit_range_selected)
+        self._branch_graph.special_row_selected.connect(self._on_special_history_row)
         self._branch_graph.cherry_pick_requested.connect(self._on_cherry_pick)
         self._branch_graph.revert_requested.connect(self._on_revert)
         self._branch_graph.reset_requested.connect(self._on_reset)
@@ -439,15 +570,36 @@ class MainWindow(QMainWindow):
         if self._git.is_open:
             branch = self._git.current_branch
             self.setWindowTitle(f"iGit - {self._git.repo_name} ({branch})")
-            self._branch_label.setText(f"🌿 {branch}")
+            self._branch_label.setText(f"{branch}")
+            self._repo_path_label.setText(os.path.basename(self._git.repo_path) or self._git.repo_path)
+            self._toolbar_branch_combo.blockSignals(True)
+            try:
+                self._toolbar_branch_combo.clear()
+                for info in self._git.get_branches():
+                    if not info.is_remote:
+                        self._toolbar_branch_combo.addItem(info.name)
+                selected = self._toolbar_branch_combo.findText(branch)
+                if selected >= 0:
+                    self._toolbar_branch_combo.setCurrentIndex(selected)
+            finally:
+                self._toolbar_branch_combo.blockSignals(False)
+            self._repo_path_label.setToolTip(self._git.repo_path)
             self._branch_status.setText(f"Branch: {branch}")
-            self._repo_status.setText(f"📁 {self._git.repo_path}")
+            self._repo_status.setText(f"{self._git.repo_path}")
         else:
             self.setWindowTitle("iGit")
             self._branch_label.setText("No repo")
+            self._repo_path_label.setText("No repository")
+            self._repo_path_label.setToolTip("")
+            self._toolbar_branch_combo.clear()
             self._branch_status.setText("")
             self._repo_status.setText("No repository open")
         self._update_undo_state()
+
+    def _on_toolbar_branch_selected(self, _index: int):
+        branch = self._toolbar_branch_combo.currentText()
+        if branch and branch != self._git.current_branch:
+            self._on_checkout_branch(branch)
 
     def _update_undo_state(self):
         """Update undo button and menu state."""
@@ -469,10 +621,29 @@ class MainWindow(QMainWindow):
 
         self._working_copy.refresh()
         self._commit_panel.refresh()
+        try:
+            status_files = self._git.get_file_status()
+            staged_count = sum(
+                1 for fs in status_files
+                if fs.staged_status or fs.staged
+            )
+            self._commit_btn.setText(
+                f"Commit ({staged_count})" if staged_count else "Commit"
+            )
+            self._stash_count_label.setText(
+                f"Stash: {len(self._git.get_stashes())}"
+            )
+        except Exception:
+            self._commit_btn.setText("Commit")
+            self._stash_count_label.setText("Stash: 0")
         # Determine if there are staged changes to commit
-        has_staged = any(fs.staged for fs in self._git.get_file_status())
+        has_staged = any(
+            fs.staged_status or fs.staged
+            for fs in self._git.get_file_status()
+        )
         self._commit_panel.set_has_staged_changes(has_staged)
         self._branch_graph.refresh()
+        self._refresh_branch_sidebar()
         self._branch_panel.refresh()
         self._stash_panel.refresh()
         self._remote_panel.refresh()
@@ -488,8 +659,185 @@ class MainWindow(QMainWindow):
 
     # ── Slots ──────────────────────────────────────────────────
 
+    def _refresh_branch_sidebar(self):
+        """Build a slash-separated branch tree with tag/remote sections."""
+        tree = self._branch_sidebar_tree
+        tree.clear()
+        branches = self._git.get_branches()
+        local = [b for b in branches if not b.is_remote]
+        remotes = [b for b in branches if b.is_remote]
+        root = QTreeWidgetItem([f"Branches ({len(local)})"])
+        root.setExpanded(True)
+        tree.addTopLevelItem(root)
+
+        try:
+            current_branch = self._git.current_branch
+        except Exception:
+            current_branch = ""
+
+        folders = {}
+        for branch in sorted(local, key=lambda b: b.name.casefold()):
+            parent = root
+            parts = branch.name.split("/")
+            accumulated = []
+            for part in parts[:-1]:
+                accumulated.append(part)
+                key = (tuple(accumulated))
+                if key not in folders:
+                    folder = QTreeWidgetItem([part])
+                    folder.setData(0, Qt.ItemDataRole.UserRole, None)
+                    parent.addChild(folder)
+                    folders[key] = folder
+                parent = folders[key]
+            leaf = QTreeWidgetItem([parts[-1]])
+            leaf.setData(0, Qt.ItemDataRole.UserRole, branch.name)
+            leaf.setToolTip(0, branch.name)
+            if branch.name == current_branch:
+                font = leaf.font(0)
+                font.setBold(True)
+                leaf.setFont(0, font)
+                leaf.setForeground(0, QColor("#d9534f"))
+            parent.addChild(leaf)
+
+        if remotes:
+            remote_root = QTreeWidgetItem([f"Remote branches ({len(remotes)})"])
+            tree.addTopLevelItem(remote_root)
+            for branch in sorted(remotes, key=lambda b: b.name.casefold()):
+                item = QTreeWidgetItem([branch.name])
+                item.setData(0, Qt.ItemDataRole.UserRole, None)
+                remote_root.addChild(item)
+
+        try:
+            tags = self._git.get_tags()
+        except Exception:
+            tags = []
+        tag_root = QTreeWidgetItem([f"Tags ({len(tags)})"])
+        tree.addTopLevelItem(tag_root)
+        for tag in tags:
+            item = QTreeWidgetItem([tag.name])
+            tag_root.addChild(item)
+
+        try:
+            stashes = self._git.get_stashes()
+        except Exception:
+            stashes = []
+        stash_root = QTreeWidgetItem([f"Stashes ({len(stashes)})"])
+        tree.addTopLevelItem(stash_root)
+        for stash in stashes:
+            stash_root.addChild(QTreeWidgetItem([stash.message]))
+
+        root.setExpanded(True)
+        self._filter_branch_sidebar(self._branch_search.text())
+
+    def _filter_branch_sidebar(self, text: str):
+        """Filter branch-tree leaves while retaining matching parents."""
+        query = text.strip().casefold()
+        tree = getattr(self, "_branch_sidebar_tree", None)
+        if tree is None:
+            return
+
+        def visit(item):
+            child_match = False
+            for i in range(item.childCount()):
+                child_match = visit(item.child(i)) or child_match
+            value = item.text(0).casefold()
+            own_match = not query or query in value
+            item.setHidden(not (own_match or child_match))
+            return own_match or child_match
+
+        for i in range(tree.topLevelItemCount()):
+            visit(tree.topLevelItem(i))
+
+    def _on_branch_sidebar_activated(self, item, _column):
+        name = item.data(0, Qt.ItemDataRole.UserRole)
+        if name and self._git.is_open:
+            self._on_checkout_branch(str(name))
+
+    def _show_git_console(self):
+        """Select the integrated Git command console."""
+        self._bottom_tabs.setCurrentWidget(self._console_input.parentWidget())
+        self._console_input.setFocus()
+
+    def _run_git_console_command(self):
+        """Run a Git CLI command without passing it through a shell."""
+        if not self._git.is_open:
+            QMessageBox.information(self, "Git Console", "Open a repository first.")
+            return
+        command = self._console_input.text().strip()
+        if not command:
+            return
+        try:
+            arguments = shlex.split(command)
+        except ValueError as exc:
+            self._console_view.appendPlainText(f"Invalid command: {exc}")
+            return
+        if arguments and arguments[0] == "git":
+            arguments = arguments[1:]
+        if not arguments:
+            self._console_view.appendPlainText("Enter a Git subcommand, for example: git status")
+            return
+        if self._console_process.state() != QProcess.NotRunning:
+            return
+
+        self._console_input.clear()
+        self._console_view.appendPlainText(
+            f"$ git {' '.join(shlex.quote(arg) for arg in arguments)}"
+        )
+        self._console_run_button.setEnabled(False)
+        self._console_stop_button.setEnabled(True)
+        self._console_process.setWorkingDirectory(self._git.repo_path)
+        environment = self._console_process.processEnvironment()
+        environment.insert("GIT_TERMINAL_PROMPT", "0")
+        environment.insert("GCM_INTERACTIVE", "Never")
+        self._console_process.setProcessEnvironment(environment)
+        self._console_process.start("git", arguments)
+
+    def _read_git_console_stdout(self):
+        output = bytes(self._console_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        if output:
+            self._console_view.insertPlainText(output)
+            self._console_view.ensureCursorVisible()
+
+    def _read_git_console_stderr(self):
+        output = bytes(self._console_process.readAllStandardError()).decode(
+            "utf-8", errors="replace"
+        )
+        if output:
+            self._console_view.insertPlainText(output)
+            self._console_view.ensureCursorVisible()
+
+    def _git_console_finished(self, exit_code, _exit_status):
+        self._read_git_console_stdout()
+        self._read_git_console_stderr()
+        self._console_view.appendPlainText(f"[Git exited with status {exit_code}]\n")
+        self._console_run_button.setEnabled(True)
+        self._console_stop_button.setEnabled(False)
+        if self._git.is_open:
+            self._refresh_all()
+
+    def _git_console_error(self, error):
+        if error == QProcess.FailedToStart:
+            self._console_view.appendPlainText(
+                f"Unable to start Git: {self._console_process.errorString()}"
+            )
+            self._console_run_button.setEnabled(True)
+            self._console_stop_button.setEnabled(False)
+
+    def _stop_git_console_command(self):
+        if self._console_process.state() != QProcess.NotRunning:
+            self._console_process.terminate()
+            QTimer.singleShot(1500, self._kill_git_console_if_running)
+
+    def _kill_git_console_if_running(self):
+        if self._console_process.state() != QProcess.NotRunning:
+            self._console_process.kill()
+
     def closeEvent(self, event):
         """Clean up on close."""
+        if self._console_process.state() != QProcess.NotRunning:
+            self._console_process.kill()
         self._undo_manager.close()
         super().closeEvent(event)
 
@@ -531,6 +879,7 @@ class MainWindow(QMainWindow):
         self._commit_panel.clear()
         self._commit_panel.set_has_staged_changes(False)
         self._branch_graph._commit_tree.clear()
+        self._branch_sidebar_tree.clear()
         self._branch_panel._branch_tree.clear()
         self._stash_panel._stash_tree.clear()
         self._remote_panel._remote_tree.clear()
@@ -622,8 +971,53 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_file_selected(self, path: str):
+        self._selected_commit_sha = None
+        self._selected_commit_range = None
         diff = self._git.get_diff(path)
         self._diff_viewer.set_diff(diff, path)
+        self._bottom_tabs.setCurrentWidget(self._bottom_tabs.widget(1))
+
+    def _populate_diff_files(self, stats):
+        self._diff_file_list.blockSignals(True)
+        self._diff_file_list.clear()
+        self._file_tree.clear()
+        for file_info in (stats or {}).get("files", []):
+            path = file_info.get("path", "")
+            if path:
+                self._diff_file_list.addItem(path)
+                row = QTreeWidgetItem([
+                    path,
+                    str(file_info.get("added", 0)),
+                    str(file_info.get("removed", 0)),
+                ])
+                self._file_tree.addTopLevelItem(row)
+        self._diff_file_list.blockSignals(False)
+        self._filter_diff_files(self._diff_file_filter.text())
+
+    def _filter_diff_files(self, text: str):
+        query = text.strip().casefold()
+        for row in range(self._diff_file_list.count()):
+            item = self._diff_file_list.item(row)
+            item.setHidden(bool(query) and query not in item.text().casefold())
+
+    def _on_diff_file_list_selected(self, path: str):
+        if not path or not self._git.is_open:
+            return
+        try:
+            if self._selected_commit_range:
+                newest, oldest = self._selected_commit_range
+                diff = self._git.get_diff_for_commit_range_file(
+                    newest, oldest, path
+                )
+            elif self._selected_commit_sha:
+                diff = self._git.get_diff_for_commit_file(
+                    self._selected_commit_sha, path
+                )
+            else:
+                diff = self._git.get_diff(path)
+            self._diff_viewer.set_diff(diff, path)
+        except Exception as exc:
+            self._diff_viewer.set_diff(f"Unable to load diff: {exc}", path)
 
     def _on_stage_file(self, path: str):
         if self._git.stage_file(path):
@@ -832,17 +1226,46 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "Error", "Failed to stash changes")
 
+    def _on_special_history_row(self, kind: str):
+        """Show the working-copy panel for history pseudo-row selections."""
+        self._selected_commit_sha = None
+        self._selected_commit_range = None
+        if kind == "workdir":
+            self._sidebar_tabs.setCurrentWidget(self._working_copy)
+            statuses = self._git.get_file_status()
+            selected = next((fs.path for fs in statuses if fs.unstaged_status), "")
+            if selected:
+                diff = self._git.get_diff(selected)
+                self._diff_viewer.set_diff(diff, selected)
+                self._bottom_tabs.setCurrentWidget(self._diff_viewer)
+        elif kind == "index":
+            self._sidebar_tabs.setCurrentWidget(self._working_copy)
+            statuses = self._git.get_file_status()
+            selected = next((fs.path for fs in statuses if fs.staged_status), "")
+            if selected:
+                diff = self._git.get_diff(selected, staged=True)
+                self._diff_viewer.set_diff(diff, selected)
+                self._bottom_tabs.setCurrentWidget(self._diff_viewer)
+
     def _on_commit_selected(self, sha: str):
+        self._selected_commit_sha = sha
+        self._selected_commit_range = None
         diff = self._git.get_diff_for_commit(sha)
         self._diff_viewer.set_diff(diff, f"Commit {sha}")
         stats = self._git.get_commit_stats(sha)
         self._diff_viewer.set_stats(stats)
+        self._populate_diff_files(stats)
+        self._bottom_tabs.setCurrentIndex(1)
 
     def _on_commit_range_selected(self, newest_sha: str, oldest_sha: str):
+        self._selected_commit_sha = None
+        self._selected_commit_range = (newest_sha, oldest_sha)
         diff = self._git.get_diff_for_commit_range(newest_sha, oldest_sha)
         self._diff_viewer.set_diff(diff, f"Commits {oldest_sha[:7]}..{newest_sha[:7]}")
         stats = self._git.get_commit_range_stats(newest_sha, oldest_sha)
         self._diff_viewer.set_stats(stats)
+        self._populate_diff_files(stats)
+        self._bottom_tabs.setCurrentIndex(1)
         # Show statistics in the status bar
         files = stats.get('total_files', 0)
         added = stats.get('total_added', 0)

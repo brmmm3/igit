@@ -3,13 +3,14 @@
 from typing import Any, Dict, List
 
 from PySide6.QtCore import (
-    Qt, Signal, QSize, QMimeData, QPointF,
+    Qt, Signal, QSize, QMimeData, QPointF, QRectF,
 )
 from PySide6.QtGui import (
-    QColor, QBrush, QPainter, QPen, QDrag, QPixmap,
+    QColor, QBrush, QPainter, QPen, QDrag, QPixmap, QFont, QFontMetrics,
 )
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
+    QWidget, QVBoxLayout, QHBoxLayout, QApplication, QStyle,
+    QStyleOptionViewItem, QHeaderView,
     QTreeWidget, QTreeWidgetItem, QStyledItemDelegate,
     QPushButton, QLabel, QAbstractItemView, QMenu,
     QComboBox, QLineEdit,
@@ -208,6 +209,7 @@ class CommitGraphLayout:
                 "color": node_color,
                 "segments": segments,
                 "is_head": bool(commits[row_index].get("is_head")),
+                "is_merge": len(parents) > 1,
             })
 
         self.rows = rows
@@ -215,11 +217,21 @@ class CommitGraphLayout:
 
 
 class CommitGraphDelegate(QStyledItemDelegate):
-    """Paint graph segments directly in the tree's Graph column."""
+    """Paint graph lanes, ref pills and the subject in column 0."""
 
     ROW_ROLE = Qt.ItemDataRole.UserRole + 1
+    PSEUDO_ROLE = Qt.ItemDataRole.UserRole + 2
+    REFS_ROLE = Qt.ItemDataRole.UserRole + 3
     NODE_RADIUS = 4.0
-    ROW_HEIGHT = 28
+    ROW_HEIGHT = 22
+
+    # kind -> (fill, border, text)
+    REF_STYLES = {
+        "head": (QColor("#d9381e"), QColor("#a82a15"), QColor("#ffffff")),
+        "local": (QColor("#e3f5e3"), QColor("#2e9b2e"), QColor("#1b5e1b")),
+        "remote": (QColor("#e6effa"), QColor("#3b78c4"), QColor("#1f4b86")),
+        "tag": (QColor("#fff4cc"), QColor("#c49a1a"), QColor("#7a5c00")),
+    }
 
     def __init__(self, graph: CommitGraphLayout, parent=None):
         super().__init__(parent)
@@ -230,66 +242,198 @@ class CommitGraphDelegate(QStyledItemDelegate):
         return QSize(size.width(), max(size.height(), self.ROW_HEIGHT))
 
     def paint(self, painter, option, index):
-        # Paint normal background, including selection.
-        super().paint(painter, option, index)
-
+        if index.column() == 1:
+            self._paint_author(painter, option, index)
+            return
         if index.column() != 0:
+            super().paint(painter, option, index)
             return
 
-        row_index = index.data(self.ROW_ROLE)
-        if row_index is None:
-            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        widget = option.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget
+        )
 
-        row_index = int(row_index)
-        if not 0 <= row_index < len(self._graph.rows):
-            return
-
-        row = self._graph.rows[row_index]
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
         rect = option.rect
-
-        # Use y + height for the boundary shared with the next row.
-        top = float(rect.y())
-        height = float(rect.height())
-
-        def point(lane, fraction):
-            return QPointF(
-                rect.x() + self._graph.lane_x(lane),
-                top + fraction * height,
-            )
 
         painter.save()
         painter.setClipRect(rect)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Draw all edges before drawing the node.
+        pseudo = index.data(self.PSEUDO_ROLE)
+        row_index = index.data(self.ROW_ROLE)
+        if pseudo:
+            self._paint_pseudo_node(painter, rect, pseudo)
+        elif row_index is not None:
+            self._paint_graph(painter, rect, int(row_index), opt)
+
+        x = rect.x() + self._graph.required_width()
+        painter.setFont(opt.font)
+        fm = QFontMetrics(opt.font)
+
+        # Ref pills
+        for label, kind in (index.data(self.REFS_ROLE) or []):
+            if x > rect.right() - 20:
+                break
+            fill, border, fg = self.REF_STYLES.get(
+                kind, self.REF_STYLES["local"]
+            )
+            width = fm.horizontalAdvance(label) + 10
+            pill = QRectF(x, rect.y() + 2, width, rect.height() - 5)
+            painter.setPen(QPen(border, 1))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(pill, 2, 2)
+            painter.setPen(fg)
+            painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, label)
+            x += width + 4
+
+        # Subject text
+        avail = rect.right() - x - 4
+        if avail > 0 and text:
+            elided = fm.elidedText(
+                text, Qt.TextElideMode.ElideRight, int(avail)
+            )
+            if selected:
+                color = opt.palette.highlightedText().color()
+            else:
+                brush = index.data(Qt.ItemDataRole.ForegroundRole)
+                color = (
+                    brush.color()
+                    if isinstance(brush, QBrush)
+                    else opt.palette.text().color()
+                )
+            painter.setPen(color)
+            painter.drawText(
+                QRectF(x, rect.y(), avail, rect.height()),
+                int(Qt.AlignmentFlag.AlignVCenter
+                    | Qt.AlignmentFlag.AlignLeft),
+                elided,
+            )
+
+        painter.restore()
+
+    def _paint_author(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget
+        )
+        if not text:
+            return
+
+        rect = option.rect
+        diameter = 14
+        x = rect.x() + 4
+        y = rect.center().y() - diameter / 2
+        hue = sum((i + 3) * ord(char) for i, char in enumerate(text)) % 360
+        circle = QRectF(x, y, diameter, diameter)
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor.fromHsv(hue, 125, 185))
+        painter.drawEllipse(circle)
+        avatar_font = QFont(option.font)
+        avatar_font.setBold(True)
+        if avatar_font.pointSizeF() > 0:
+            avatar_font.setPointSizeF(max(6.0, avatar_font.pointSizeF() - 3))
+        painter.setFont(avatar_font)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(circle, Qt.AlignmentFlag.AlignCenter, text[0].upper())
+
+        text_x = x + diameter + 5
+        text_rect = QRectF(text_x, rect.y(), rect.right() - text_x - 2,
+                           rect.height())
+        painter.setFont(option.font)
+        color = (
+            option.palette.highlightedText().color()
+            if option.state & QStyle.StateFlag.State_Selected
+            else option.palette.text().color()
+        )
+        painter.setPen(color)
+        fm = QFontMetrics(option.font)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            fm.elidedText(text, Qt.TextElideMode.ElideRight,
+                          int(text_rect.width())),
+        )
+        painter.restore()
+
+    def _point(self, rect, lane, fraction):
+        return QPointF(
+            rect.x() + self._graph.lane_x(lane),
+            rect.y() + fraction * rect.height(),
+        )
+
+    def _paint_graph(self, painter, rect, row_index, opt):
+        if not 0 <= row_index < len(self._graph.rows):
+            return
+        row = self._graph.rows[row_index]
+
         for lane_a, y_a, lane_b, y_b, color in row["segments"]:
             pen = QPen(color, 2.0)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
             painter.drawLine(
-                point(lane_a, y_a),
-                point(lane_b, y_b),
+                self._point(rect, lane_a, y_a),
+                self._point(rect, lane_b, y_b),
             )
 
-        center = point(row["lane"], 0.5)
+        center = self._point(rect, row["lane"], 0.5)
         color = row["color"]
         radius = self.NODE_RADIUS + (1 if row["is_head"] else 0)
 
         painter.setPen(QPen(color.darker(140), 1.0))
         painter.setBrush(color)
-        painter.drawEllipse(center, radius, radius)
+        if row.get("is_merge"):
+            painter.drawRect(QRectF(
+                center.x() - radius, center.y() - radius,
+                radius * 2, radius * 2,
+            ))
+        else:
+            painter.drawEllipse(center, radius, radius)
 
         if row["is_head"]:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(option.palette.base())
+            painter.setBrush(opt.palette.base())
             painter.drawEllipse(
-                center,
-                self.NODE_RADIUS - 1,
-                self.NODE_RADIUS - 1,
+                center, self.NODE_RADIUS - 1, self.NODE_RADIUS - 1
             )
 
-        painter.restore()
+    def _paint_pseudo_node(self, painter, rect, kind):
+        head = next(
+            (row for row in self._graph.rows if row.get("is_head")),
+            self._graph.rows[0] if self._graph.rows else None,
+        )
+        lane = head["lane"] if head else 0
+        color = head["color"] if head else QColor("#808080")
+        pen = QPen(color, 2.0)
+        pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(pen)
+        top = 0.5 if kind == "workdir" else 0.0
+        painter.drawLine(
+            self._point(rect, lane, top), self._point(rect, lane, 1.0)
+        )
+        center = self._point(rect, lane, 0.5)
+        r = self.NODE_RADIUS
+        painter.setPen(QPen(color.darker(140), 1.0))
+        painter.setBrush(color)
+        if kind == "index":
+            painter.drawEllipse(center, r, r)
+        else:
+            painter.drawRect(QRectF(center.x() - r, center.y() - r,
+                                    r * 2, r * 2))
 
 
 class BranchGraphPanel(QWidget):
@@ -297,6 +441,7 @@ class BranchGraphPanel(QWidget):
 
     commit_selected = Signal(str)
     commit_range_selected = Signal(str, str)
+    special_row_selected = Signal(str)  # "workdir" or "index"
     branch_checkout_requested = Signal(str)
     branch_merge_requested = Signal(str)
     cherry_pick_requested = Signal(str)
@@ -309,38 +454,37 @@ class BranchGraphPanel(QWidget):
         super().__init__(parent)
         self._git = git_ops
         self._commits: List[Dict[str, Any]] = []
-        self._commit_totals = {}
         self._graph = CommitGraphLayout()
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(0)
 
         toolbar = QHBoxLayout()
-        toolbar.setContentsMargins(8, 8, 8, 0)
+        toolbar.setContentsMargins(4, 2, 4, 2)
+        toolbar.setSpacing(4)
 
-        title = QLabel("History")
-        title.setObjectName("sectionTitle")
-        toolbar.addWidget(title)
-
+        toolbar.addWidget(QLabel("Branches:"))
         self._branch_combo = QComboBox()
-        self._branch_combo.setMinimumWidth(200)
+        self._branch_combo.setMinimumWidth(180)
         self._branch_combo.currentTextChanged.connect(
             self._on_branch_changed
         )
         toolbar.addWidget(self._branch_combo)
 
+        toolbar.addWidget(QLabel("Filter:"))
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Highlight commits...")
-        self._search_edit.setMaximumWidth(200)
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.setMaximumWidth(260)
         self._search_edit.textChanged.connect(self._on_search)
         toolbar.addWidget(self._search_edit)
 
-        self._refresh_btn = QPushButton("🔄")
+        self._refresh_btn = QPushButton("⟳")
         self._refresh_btn.setToolTip("Refresh history")
-        self._refresh_btn.setMaximumWidth(32)
+        self._refresh_btn.setMaximumWidth(28)
         self._refresh_btn.clicked.connect(self.refresh)
         toolbar.addWidget(self._refresh_btn)
 
@@ -349,21 +493,19 @@ class BranchGraphPanel(QWidget):
 
         self._commit_tree = QTreeWidget()
         self._commit_tree.setHeaderLabels([
-            "Graph",
-            "Hash",
+            "Graph / Message",
             "Author",
-            "Message",
             "Date",
-            "Changes",
-            "Branches / Tags",
+            "ID",
         ])
 
         self._commit_tree.setUniformRowHeights(True)
         self._commit_tree.setRootIsDecorated(False)
         self._commit_tree.setIndentation(0)
         self._commit_tree.setSortingEnabled(False)
-        self._commit_tree.setAlternatingRowColors(True)
+        self._commit_tree.setAlternatingRowColors(False)
         self._commit_tree.setWordWrap(False)
+        self._commit_tree.setTextElideMode(Qt.TextElideMode.ElideRight)
 
         self._commit_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
@@ -378,13 +520,13 @@ class BranchGraphPanel(QWidget):
             QAbstractItemView.ScrollMode.ScrollPerPixel
         )
 
-        self._commit_tree.setColumnWidth(0, 60)
-        self._commit_tree.setColumnWidth(1, 90)
-        self._commit_tree.setColumnWidth(2, 140)
-        self._commit_tree.setColumnWidth(3, 350)
-        self._commit_tree.setColumnWidth(4, 160)
-        self._commit_tree.setColumnWidth(5, 100)
-        self._commit_tree.header().setStretchLastSection(True)
+        self._commit_tree.setColumnWidth(1, 160)
+        self._commit_tree.setColumnWidth(2, 155)
+        self._commit_tree.setColumnWidth(3, 75)
+        self._commit_tree.header().setStretchLastSection(False)
+        self._commit_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
         self._commit_tree.header().setSectionsMovable(False)
 
         self._graph_delegate = CommitGraphDelegate(
@@ -450,24 +592,53 @@ class BranchGraphPanel(QWidget):
             branch=branch,
             max_count=200,
         )
-        totals = self._git.get_commit_totals_bulk(
-            max_count=200,
-            branch=branch,
-        )
-
         # Validate and build before replacing the displayed history.
         self._graph.set_commits(commits)
         self._commits = commits
-        self._commit_totals = totals
 
         self._commit_tree.setUpdatesEnabled(False)
         self._commit_tree.blockSignals(True)
 
         try:
             self._commit_tree.clear()
-            self._commit_tree.setColumnWidth(
-                0, self._graph.required_width()
-            )
+
+            try:
+                current_branch = self._git.current_branch
+            except Exception:
+                current_branch = ""
+
+            modified = deleted = added = staged = 0
+            try:
+                for file_status in self._git.get_file_status():
+                    if file_status.staged_status:
+                        staged += 1
+                    code = file_status.unstaged_status
+                    if code == "D":
+                        deleted += 1
+                    elif code in ("A", "?"):
+                        added += 1
+                    elif code:
+                        modified += 1
+            except Exception:
+                pass
+
+            if modified or deleted or added:
+                counts = []
+                if modified:
+                    counts.append(f"{modified} modified")
+                if deleted:
+                    counts.append(f"{deleted} deleted")
+                if added:
+                    counts.append(f"{added} added")
+                item = QTreeWidgetItem()
+                item.setText(0, f"Working directory ({', '.join(counts)})")
+                item.setData(0, CommitGraphDelegate.PSEUDO_ROLE, "workdir")
+                self._commit_tree.addTopLevelItem(item)
+            if staged:
+                item = QTreeWidgetItem()
+                item.setText(0, f"Commit index ({staged} staged)")
+                item.setData(0, CommitGraphDelegate.PSEUDO_ROLE, "index")
+                self._commit_tree.addTopLevelItem(item)
 
             for row, commit in enumerate(self._commits):
                 item = QTreeWidgetItem()
@@ -477,73 +648,45 @@ class BranchGraphPanel(QWidget):
                 item.setData(0, Qt.ItemDataRole.UserRole, sha)
                 item.setData(0, CommitGraphDelegate.ROW_ROLE, row)
 
-                item.setText(1, commit["sha"][:7])
-                item.setToolTip(1, sha)
-                item.setForeground(1, QBrush(color))
-
-                font = item.font(1)
-                font.setFamily("monospace")
-                item.setFont(1, font)
-
                 author = commit.get("author") or ""
-                item.setText(2, author)
-                item.setToolTip(2, author)
+                item.setText(1, author)
+                item.setToolTip(1, author)
 
                 message = commit.get("message") or ""
                 subject = message.splitlines()[0] if message else ""
-                item.setText(3, subject)
-                item.setToolTip(3, message)
+                item.setText(0, subject)
+                item.setToolTip(0, message)
 
                 dt = commit.get("datetime")
                 if dt is not None:
-                    item.setText(4, dt.strftime("%Y-%m-%d %H:%M:%S"))
+                    item.setText(2, dt.strftime("%Y-%m-%d %H:%M:%S"))
                     item.setToolTip(
-                        4, dt.strftime("%A, %B %d, %Y at %H:%M:%S")
+                        2, dt.strftime("%A, %B %d, %Y at %H:%M:%S")
                     )
 
-                stats = self._commit_totals.get(sha)
-                if stats is None:
-                    stats = self._commit_totals.get(commit["sha"], {})
-
-                added = stats.get("added", 0)
-                removed = stats.get("removed", 0)
-                files = stats.get("files", 0)
-
-                item.setText(5, f"+{added}/-{removed}")
-                item.setToolTip(
-                    5,
-                    f"{files} file(s) changed, "
-                    f"+{added} added, -{removed} removed",
-                )
-
-                if added or removed:
-                    item.setForeground(
-                        5,
-                        QBrush(QColor(
-                            "#1a7f37"
-                            if added >= removed
-                            else "#cf222e"
-                        )),
-                    )
+                item.setText(3, commit["sha"][:7])
+                item.setToolTip(3, sha)
+                item.setForeground(3, QBrush(color))
+                hash_font = item.font(3)
+                hash_font.setFamily("monospace")
+                item.setFont(3, hash_font)
 
                 refs = []
-                if commit.get("is_head"):
-                    refs.append("HEAD")
+                for name in (commit.get("branches") or []):
+                    refs.append((name, "head" if name == current_branch else "local"))
+                for name in (commit.get("remote_branches") or []):
+                    refs.append((name, "remote"))
+                for name in (commit.get("tags") or []):
+                    refs.append((name, "tag"))
+                if commit.get("is_head") and not refs:
+                    refs.append(("HEAD", "head"))
+                item.setData(0, CommitGraphDelegate.REFS_ROLE, refs)
 
-                refs.extend(
-                    f"🌿 {name}"
-                    for name in (commit.get("branches") or [])
-                )
-                refs.extend(
-                    f"🏷️ {name}"
-                    for name in (commit.get("tags") or [])
-                )
-
-                item.setText(6, "  ".join(refs))
-                item.setToolTip(6, "\n".join(refs))
+                ref_text = [name for name, _kind in refs]
+                item.setToolTip(0, message + ("\nRefs: " + ", ".join(ref_text) if ref_text else ""))
 
                 if commit.get("is_head"):
-                    for column in range(7):
+                    for column in range(4):
                         font = item.font(column)
                         font.setBold(True)
                         item.setFont(column, font)
@@ -573,10 +716,11 @@ class BranchGraphPanel(QWidget):
             item.setHidden(False)
 
             searchable = [
-                item.text(column) for column in range(1, 7)
+                item.text(column) for column in range(4)
             ]
             searchable.extend([
                 str(item.data(0, Qt.ItemDataRole.UserRole) or ""),
+                item.toolTip(0),
                 item.toolTip(3),
             ])
 
@@ -590,7 +734,7 @@ class BranchGraphPanel(QWidget):
                 if matches else QBrush()
             )
 
-            for column in range(7):
+            for column in range(4):
                 item.setBackground(column, background)
 
             if matches and first_match is None:
@@ -612,6 +756,15 @@ class BranchGraphPanel(QWidget):
             key=self._commit_tree.indexOfTopLevelItem,
         )
 
+        specials = [
+            item.data(0, CommitGraphDelegate.PSEUDO_ROLE)
+            for item in items
+        ]
+        specials = [kind for kind in specials if kind]
+        if specials:
+            self.special_row_selected.emit(str(specials[0]))
+            return
+
         shas = [
             item.data(0, Qt.ItemDataRole.UserRole)
             for item in items
@@ -632,7 +785,7 @@ class BranchGraphPanel(QWidget):
         if not sha:
             return
 
-        message = item.text(3)[:50]
+        message = item.text(0)[:50]
 
         mime_data = QMimeData()
         mime_data.setText(f"commit:{sha}")
